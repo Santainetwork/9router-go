@@ -263,3 +263,183 @@ func TestEvictionSparesAdmittingKey(t *testing.T) {
 		t.Errorf("sweep left %d entries, want <= %d", after, rl.maxKeys*9/10)
 	}
 }
+
+// TestQueueDepthCapExactBoundary proves the cap is "at or above": with a cap of
+// 2, exactly 2 waiters park and the 3rd is refused. An off-by-one here would
+// either waste a slot of capacity or admit one goroutine past the bound.
+func TestQueueDepthCapExactBoundary(t *testing.T) {
+	rl := NewRateLimiter(time.Minute)
+	rl.maxQueueDepth = 2
+
+	const key = "depth-exact"
+	if _, ok := rl.Acquire(context.Background(), key, 0, 1, 0); !ok {
+		t.Fatal("failed to take the only slot")
+	}
+
+	// Park exactly two.
+	go rl.Acquire(context.Background(), key, 0, 1, 3*time.Second)
+	waitForQueueLen(t, rl, key, 1)
+	go rl.Acquire(context.Background(), key, 0, 1, 3*time.Second)
+	waitForQueueLen(t, rl, key, 2)
+
+	rl.mu.Lock()
+	queued := len(rl.queues[key].waiters)
+	rl.mu.Unlock()
+	if queued != 2 {
+		t.Fatalf("queue holds %d waiters at the cap, want 2", queued)
+	}
+
+	// The third is refused at once.
+	if _, ok := rl.Acquire(context.Background(), key, 0, 1, 100*time.Millisecond); ok {
+		t.Fatal("Acquire admitted a request past the exact cap")
+	}
+}
+
+// TestQueueDepthZeroFallsBackToDefault proves a hand-built RateLimiter with a
+// zero depth does not refuse every request: the cap falls back to the default
+// rather than comparing against zero.
+func TestQueueDepthZeroFallsBackToDefault(t *testing.T) {
+	rl := &RateLimiter{
+		windows:       nil,
+		tokens:        nil,
+		active:        map[string]*int32{},
+		queues:        map[string]*waitQueue{},
+		windowTimers:  map[string]*time.Timer{},
+		window:        time.Minute,
+		maxKeys:       10,
+		maxQueueDepth: 0,
+	}
+	const key = "zero-cap"
+	if _, ok := rl.Acquire(context.Background(), key, 0, 1, 0); !ok {
+		t.Fatal("failed to take the only slot")
+	}
+	// This must park (default cap allows it), not refuse.
+	go rl.Acquire(context.Background(), key, 0, 1, 3*time.Second)
+	waitForQueueLen(t, rl, key, 1)
+}
+
+// TestCancelledWaiterFreesItsQueueSlot proves a waiter that leaves on cancel
+// does not occupy queue depth: after it goes, the queue is empty and a later
+// request can park again. This ties fix #2 (cancel) to fix #5 (depth).
+func TestCancelledWaiterFreesItsQueueSlot(t *testing.T) {
+	rl := NewRateLimiter(time.Minute)
+	rl.maxQueueDepth = 1
+
+	const key = "cancel-free"
+	if _, ok := rl.Acquire(context.Background(), key, 0, 1, 0); !ok {
+		t.Fatal("failed to take the only slot")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rl.Acquire(ctx, key, 0, 1, 5*time.Second)
+	}()
+	waitForQueueLen(t, rl, key, 1)
+
+	// The queue is full, so another request is refused.
+	if _, ok := rl.Acquire(context.Background(), key, 0, 1, 50*time.Millisecond); ok {
+		t.Fatal("queue was not full despite one parked waiter")
+	}
+
+	// Cancel the parked waiter; it must release its queue slot.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled waiter did not return")
+	}
+	waitForQueueLen(t, rl, key, 0) // drains to 0
+
+	// Now a fresh request can park again (the slot was freed).
+	go rl.Acquire(context.Background(), key, 0, 1, 2*time.Second)
+	waitForQueueLen(t, rl, key, 1)
+}
+
+// TestRefundTPMNoBucketIsSafe proves a refund for a key with no token bucket is
+// a no-op, not a panic or a spurious bucket creation.
+func TestRefundTPMNoBucketIsSafe(t *testing.T) {
+	rl := NewRateLimiter(time.Minute)
+	rl.RefundTPM("never-charged", 1000, 500)
+	if _, exists := rl.tokens["never-charged"]; exists {
+		t.Error("refund created a token bucket for a key that was never charged")
+	}
+	// Non-positive amounts and tpm are also no-ops.
+	rl.RefundTPM("k", 0, 100)
+	rl.RefundTPM("k", 100, 0)
+	rl.RefundTPM("", 100, 100)
+}
+
+// TestRefundTPMThenSettleIsConsistent proves a refund followed by a settle
+// cannot push the bucket above its limit, and settle still only corrects an
+// under-estimate.
+func TestRefundTPMThenSettleIsConsistent(t *testing.T) {
+	rl := NewRateLimiter(time.Minute)
+	const key = "refund-settle"
+
+	// Charge 300 of a 1000 bucket.
+	if !rl.checkTPM(key, 1000, 300, time.Now()) {
+		t.Fatal("charge refused")
+	}
+	// Refund it all (the request was refused by the queue).
+	rl.RefundTPM(key, 1000, 300)
+	rl.mu.Lock()
+	afterRefund := rl.tokens[key].tokens
+	rl.mu.Unlock()
+	if afterRefund > 1000 {
+		t.Fatalf("bucket = %v after refund, want <= 1000", afterRefund)
+	}
+
+	// A settle that claims an under-estimate must not exceed the limit either.
+	rl.SettleTokenUsage(key, 1000, 0, 100000)
+	rl.mu.Lock()
+	afterSettle := rl.tokens[key].tokens
+	rl.mu.Unlock()
+	if afterSettle < 0 {
+		t.Errorf("bucket went negative after settle: %v", afterSettle)
+	}
+}
+
+// TestLimitsForGlobalDefaultDisabled proves the disabled global-default path
+// (the router returns Limits{} when the operator has not enabled global
+// defaults) yields no queue: no concurrency from the fallback means nothing to
+// wait for regardless of the key's own columns.
+func TestLimitsForGlobalDefaultDisabled(t *testing.T) {
+	disabled := func() Limits { return Limits{} }
+
+	// A key with no columns of its own: nothing applies.
+	l := limitsFor(&models.APIKey{ID: "k"}, disabled)
+	if l.Concurrency != 0 || l.QueueTimeout != 0 {
+		t.Errorf("disabled defaults produced %+v, want zero limits", l)
+	}
+
+	// A key with its own concurrency cap still gets the documented default even
+	// with global defaults off.
+	perKey := limitsFor(&models.APIKey{ID: "k", RateLimitConcurrency: new(2)}, disabled)
+	if perKey.QueueTimeout != DefaultQueueTimeout {
+		t.Errorf("per-key capped QueueTimeout = %v, want %v", perKey.QueueTimeout, DefaultQueueTimeout)
+	}
+}
+
+// TestLimitsForPerKeyOverridesGlobal proves a key's own values always win over
+// the global fallback, including the queue timeout: a global default cannot
+// raise a per-key cap, and a per-key cap cannot be lowered by a global one.
+func TestLimitsForPerKeyOverridesGlobal(t *testing.T) {
+	global := func() Limits { return Limits{RPM: 10, TPM: 100, Concurrency: 2} }
+
+	// Key raises every axis and sets its own queue timeout.
+	l := limitsFor(&models.APIKey{
+		ID:                   "k",
+		RateLimitRPM:         new(50),
+		RateLimitTPM:         new(500),
+		RateLimitConcurrency: new(8),
+		QueueTimeoutMs:       new(250),
+	}, global)
+	if l.RPM != 50 || l.TPM != 500 || l.Concurrency != 8 {
+		t.Errorf("per-key limits did not win: %+v", l)
+	}
+	if l.QueueTimeout != 250*time.Millisecond {
+		t.Errorf("QueueTimeout = %v, want 250ms (per-key)", l.QueueTimeout)
+	}
+}

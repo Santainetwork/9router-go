@@ -201,13 +201,19 @@ func (rl *RateLimiter) Acquire(ctx context.Context, keyID string, rpm, concurren
 	// Depth cap: past it, refuse rather than park another live goroutine. This
 	// is the pre-queue behaviour on a key with no queue budget, and it keeps a
 	// rate-limit rejection from turning into unbounded memory growth under a
-	// flood.
-	if q := rl.queueForLocked(keyID); len(q.waiters) >= rl.maxQueueDepth {
+	// flood. A non-positive cap (only reachable from a hand-built RateLimiter)
+	// falls back to the default rather than refusing every request, which is
+	// what a bare >= comparison against zero would do.
+	depth := rl.maxQueueDepth
+	if depth <= 0 {
+		depth = DefaultMaxQueueDepth
+	}
+	q := rl.queueForLocked(keyID)
+	if len(q.waiters) >= depth {
 		rl.mu.Unlock()
 		return time.Since(start), false
-	} else {
-		q.waiters = append(q.waiters, w)
 	}
+	q.waiters = append(q.waiters, w)
 	rl.pumpLocked(keyID)
 	rl.mu.Unlock()
 

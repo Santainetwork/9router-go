@@ -167,3 +167,64 @@ func TestUsageHistoryApiKeyIndexExists(t *testing.T) {
 		t.Errorf("query plan does not use idx_uh_apikey:\n%s", plan)
 	}
 }
+
+// TestUsageHistoryApiKeyIndexAddedOnUpgrade proves an existing database that
+// predates the index picks it up on the next boot. EnsureCoreSchema reruns the
+// CREATE INDEX IF NOT EXISTS list, so an install upgraded in place gets the
+// index without a migration step — this is the case the reviewer's item #4
+// depends on for existing deployments.
+func TestUsageHistoryApiKeyIndexAddedOnUpgrade(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy_idx.sqlite")
+	conn, err := OpenDatabase(path)
+	if err != nil {
+		t.Fatalf("OpenDatabase: %v", err)
+	}
+	defer conn.Close()
+
+	// A legacy usageHistory with rows and no apiKey index.
+	if _, err := conn.Exec(`CREATE TABLE usageHistory (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
+		provider TEXT, model TEXT, connectionId TEXT, apiKey TEXT, endpoint TEXT,
+		promptTokens INTEGER DEFAULT 0, completionTokens INTEGER DEFAULT 0,
+		cost REAL DEFAULT 0, status TEXT, tokens TEXT, meta TEXT
+	)`); err != nil {
+		t.Fatalf("legacy table: %v", err)
+	}
+	for i := 0; i < 50; i++ {
+		if _, err := conn.Exec(
+			`INSERT INTO usageHistory(timestamp, apiKey, promptTokens, completionTokens) VALUES(?,?,?,?)`,
+			"2026-01-01T00:00:00Z", "sk-legacy", 10, 5); err != nil {
+			t.Fatalf("seed row: %v", err)
+		}
+	}
+	// Precondition: no index yet.
+	var before int
+	if err := conn.QueryRow(`SELECT COUNT(1) FROM sqlite_master WHERE type='index' AND name='idx_uh_apikey'`).Scan(&before); err != nil {
+		t.Fatalf("pre-check: %v", err)
+	}
+	if before != 0 {
+		t.Fatal("index existed before upgrade; test setup is wrong")
+	}
+
+	// Upgrade in place.
+	if err := EnsureCoreSchema(conn); err != nil {
+		t.Fatalf("EnsureCoreSchema: %v", err)
+	}
+
+	var after int
+	if err := conn.QueryRow(`SELECT COUNT(1) FROM sqlite_master WHERE type='index' AND name='idx_uh_apikey'`).Scan(&after); err != nil {
+		t.Fatalf("post-check: %v", err)
+	}
+	if after != 1 {
+		t.Fatal("idx_uh_apikey was not created on upgrade")
+	}
+
+	// The pre-existing rows survive the upgrade.
+	var rows int
+	if err := conn.QueryRow(`SELECT COUNT(1) FROM usageHistory WHERE apiKey='sk-legacy'`).Scan(&rows); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if rows != 50 {
+		t.Errorf("usageHistory rows after upgrade = %d, want 50", rows)
+	}
+}
