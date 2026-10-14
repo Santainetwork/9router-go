@@ -77,9 +77,18 @@ func TestAcquireAlreadyCancelledContextDoesNotPark(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already done
 
+	// A done context must be refused on the fast path, not after parking until
+	// the timeout: with a 5s budget, returning in well under that is the proof
+	// it never entered the queue. (Asserting only the return value would pass
+	// even if the request parked the full 5s and then timed out.)
+	start := time.Now()
 	_, ok := rl.Acquire(ctx, key, 0, 1, 5*time.Second)
+	elapsed := time.Since(start)
 	if ok {
 		t.Fatal("Acquire admitted a caller whose context was already cancelled")
+	}
+	if elapsed > time.Second {
+		t.Errorf("Acquire took %v for an already-cancelled context; it should refuse at once, not park", elapsed)
 	}
 	rl.mu.Lock()
 	queued := 0
@@ -561,23 +570,16 @@ func TestMiddlewareDoesNotRefundOnTPMRefusal(t *testing.T) {
 	}
 }
 
-// TestMiddlewareNoReservationWhenQueueRefuses proves the settlement hook is
-// installed only for an admitted request. A queue-refused request must not carry
-// a TPM reservation: the metering path would otherwise settle a charge that was
-// already refunded, double-counting it.
-func TestMiddlewareNoReservationWhenQueueRefuses(t *testing.T) {
-	rl := NewRateLimiter(time.Minute)
-	const key = "mw-resv"
-
-	var sawReservation bool
-	var hadSettle bool
-	handler := RequireRateLimit(rl, nil, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, sawReservation = ReservedTokensFromContext(r.Context())
-		// A settler is installed by the chat handler, not this middleware, so
-		// here we only assert the reservation side.
-		w.WriteHeader(http.StatusOK)
-	}))
-	_ = hadSettle
+// TestMiddlewareQueueRefusalLeavesNoTPMCharge is the durable assertion behind
+// the reservation placement: a request the queue refuses must end with its TPM
+// charge given back. (Whether a reservation briefly lived on a context that is
+// then discarded is not observable and not what matters; the bucket balance is.)
+func TestMiddlewareQueueRefusalLeavesNoTPMCharge(t *testing.T) {
+	// A long window makes the refill rate negligible (tpm/window), so a missed
+	// refund shows up as a real drop rather than being refilled away during the
+	// test.
+	rl := NewRateLimiter(time.Hour)
+	const key = "mw-nocharge"
 
 	mkReq := func(content string) *http.Request {
 		body := `{"model":"gpt-4o","messages":[{"role":"user","content":"` + content + `"}]}`
@@ -606,15 +608,28 @@ func TestMiddlewareNoReservationWhenQueueRefuses(t *testing.T) {
 	}()
 	<-entered
 
-	// Queue-refused request: must never reach the handler, so sawReservation
-	// must stay false.
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, mkReq("refused"))
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429", rec.Code)
+	rl.mu.Lock()
+	afterHolder := rl.tokens[key].tokens
+	rl.mu.Unlock()
+
+	// Five queue-refused requests in a row. Each is charged then refused; if any
+	// refund is missed the bucket ratchets down by that request's estimate.
+	for i := 0; i < 5; i++ {
+		rec := httptest.NewRecorder()
+		RequireRateLimit(rl, nil, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})).
+			ServeHTTP(rec, mkReq(strings.Repeat("refused ", 200)))
+		if rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("request %d status = %d, want 429", i, rec.Code)
+		}
 	}
-	if sawReservation {
-		t.Error("a queue-refused request reached the handler with a TPM reservation")
+
+	rl.mu.Lock()
+	after := rl.tokens[key].tokens
+	rl.mu.Unlock()
+	// Allow for a little refill; the point is it must not have dropped by five
+	// requests' worth of tokens.
+	if after < afterHolder-50 {
+		t.Errorf("bucket = %v after 5 queue refusals, want ~%v: charges were not refunded", after, afterHolder)
 	}
 	close(release)
 }
