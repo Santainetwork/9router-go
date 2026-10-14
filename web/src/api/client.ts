@@ -87,6 +87,10 @@ export interface APIKey {
   rateLimitRpm?: number
   rateLimitTpm?: number
   rateLimitConcurrency?: number
+  /** Lifetime prompt+completion token budget. 0 means unlimited. */
+  tokenQuota?: number
+  /** How long a request waits for a free concurrency slot, in ms. 0 uses the server default. */
+  queueTimeoutMs?: number
   /** RFC3339 UTC. Empty means the key never expires. */
   expiresAt?: string
   lastUsedAt?: string
@@ -99,6 +103,10 @@ export interface APIKeyPolicy {
   rateLimitRpm?: number
   rateLimitTpm?: number
   rateLimitConcurrency?: number
+  /** Lifetime token budget. 0 means unlimited. */
+  tokenQuota?: number
+  /** Concurrency queue timeout in ms. 0 uses the server default. */
+  queueTimeoutMs?: number
   expiresAt?: string
   metadata?: string
   /** Renames the key. An empty string clears the stored name. */

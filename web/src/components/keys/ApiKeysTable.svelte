@@ -141,6 +141,9 @@
     if ((k.rateLimitConcurrency ?? 0) > 0) {
       badges.push({ label: `${(k.rateLimitConcurrency ?? 0).toLocaleString()} conc`, tone: 'info' })
     }
+    if ((k.tokenQuota ?? 0) > 0) {
+      badges.push({ label: `${(k.tokenQuota ?? 0).toLocaleString()} tok quota`, tone: 'info' })
+    }
     if ((k.expiresAt ?? '') !== '') {
       badges.push({ label: isExpired(k) ? 'expired' : 'expires', tone: isExpired(k) ? 'danger' : 'info' })
     }

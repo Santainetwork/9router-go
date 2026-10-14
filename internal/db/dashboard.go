@@ -8,6 +8,7 @@ import (
 	"slices"
 	"time"
 
+	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/models"
 )
 
@@ -217,12 +218,12 @@ func (r *Repo) DeleteCombo(id string) error {
 }
 
 // GetApiKeys retrieves all client API keys ordered by createdAt DESC.
+//
+// The read goes through the shared apiKeyColumns/apiKeyScan pair so a new
+// governance column is added in exactly one place; a hand-copied SELECT here
+// is how a column silently stops being returned to the dashboard.
 func (r *Repo) GetApiKeys() ([]*models.APIKey, error) {
-	rows, err := r.db.Query(`SELECT id, key, name, machineId, isActive, createdAt,
-		rateLimitRPM, rateLimitTPM, rateLimitConcurrency,
-		keyHash, lookupHash, keyDisplay,
-		expiresAt, lastUsedAt, usedCount, metadata
-		FROM apiKeys ORDER BY createdAt DESC`)
+	rows, err := r.db.Query(apiKeyColumns + ` FROM apiKeys ORDER BY createdAt DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("get api keys: %w", err)
 	}
@@ -231,57 +232,11 @@ func (r *Repo) GetApiKeys() ([]*models.APIKey, error) {
 	keys := make([]*models.APIKey, 0)
 	for rows.Next() {
 		var k models.APIKey
-		var nameVal, machineVal sql.NullString
-		var rateRPM, rateTPM, rateConc sql.NullInt64
-		var keyHash, lookupHash, keyDisplay sql.NullString
-		var expiresAt, lastUsedAt, metadata sql.NullString
-		var usedCount sql.NullInt64
-		if err := rows.Scan(&k.ID, &k.Key, &nameVal, &machineVal, &k.IsActive, &k.CreatedAt,
-			&rateRPM, &rateTPM, &rateConc,
-			&keyHash, &lookupHash, &keyDisplay,
-			&expiresAt, &lastUsedAt, &usedCount, &metadata); err != nil {
+		dest, apply := apiKeyScan(&k)
+		if err := rows.Scan(dest...); err != nil {
 			return nil, fmt.Errorf("scan api key: %w", err)
 		}
-		if nameVal.Valid {
-			k.Name = &nameVal.String
-		}
-		if machineVal.Valid {
-			k.MachineID = &machineVal.String
-		}
-		if rateRPM.Valid {
-			v := int(rateRPM.Int64)
-			k.RateLimitRPM = &v
-		}
-		if rateTPM.Valid {
-			v := int(rateTPM.Int64)
-			k.RateLimitTPM = &v
-		}
-		if rateConc.Valid {
-			v := int(rateConc.Int64)
-			k.RateLimitConcurrency = &v
-		}
-		if keyHash.Valid {
-			k.KeyHash = &keyHash.String
-		}
-		if lookupHash.Valid {
-			k.LookupHash = &lookupHash.String
-		}
-		if keyDisplay.Valid {
-			k.KeyDisplay = &keyDisplay.String
-		}
-		if expiresAt.Valid {
-			k.ExpiresAt = &expiresAt.String
-		}
-		if lastUsedAt.Valid {
-			k.LastUsedAt = &lastUsedAt.String
-		}
-		if usedCount.Valid {
-			v := int(usedCount.Int64)
-			k.UsedCount = &v
-		}
-		if metadata.Valid {
-			k.Metadata = &metadata.String
-		}
+		apply()
 		keys = append(keys, &k)
 	}
 	if err := rows.Err(); err != nil {
@@ -355,6 +310,47 @@ func (r *Repo) SetApiKeyRateLimit(keyID string, rpm, tpm, concurrency int) error
 		return fmt.Errorf("set api key rate limit %s: %w", keyID, err)
 	}
 	return nil
+}
+
+// SetApiKeyBudget updates the cumulative token quota and the concurrency-queue
+// timeout for an API key (F-1b).
+//
+// Both are whole non-negative counts where 0 means "unset": a quota of 0 is
+// unlimited and a queue timeout of 0 falls back to the server default, exactly
+// as the dashboard's own columns read them.
+func (r *Repo) SetApiKeyBudget(keyID string, tokenQuota, queueTimeoutMs int) error {
+	_, err := r.db.Exec(
+		`UPDATE apiKeys SET tokenQuota = ?, queueTimeoutMs = ? WHERE id = ?`,
+		tokenQuota, queueTimeoutMs, keyID,
+	)
+	if err != nil {
+		return fmt.Errorf("set api key budget %s: %w", keyID, err)
+	}
+	return nil
+}
+
+// GetApiKeyTokenUsage returns the cumulative prompt+completion tokens a key has
+// spent over its whole life, which is what tokenQuota is measured against.
+//
+// Matching is by the raw key's masked form, because that is what this gateway
+// writes into usageHistory (maskAPIKey). The stored value is not uniform across
+// a shared database: rows the upstream Next.js dashboard wrote keep the full
+// key, so both spellings are matched. A missing or empty history is 0 tokens
+// spent, not an error — a fresh key has simply spent nothing.
+func (r *Repo) GetApiKeyTokenUsage(rawKey string) (int, error) {
+	if rawKey == "" {
+		return 0, nil
+	}
+	var used int64
+	err := r.db.QueryRow(
+		`SELECT COALESCE(SUM(COALESCE(promptTokens,0) + COALESCE(completionTokens,0)), 0)
+		   FROM usageHistory WHERE apiKey = ? OR apiKey = ?`,
+		rawKey, handlerutil.MaskAPIKey(rawKey),
+	).Scan(&used)
+	if err != nil {
+		return 0, fmt.Errorf("get api key token usage: %w", err)
+	}
+	return int(used), nil
 }
 
 // SetApiKeyExpiry sets expiresAt for an API key.

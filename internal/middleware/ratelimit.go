@@ -18,14 +18,46 @@ import (
 )
 
 // RateLimiter implements per-key rate limiting with sliding window RPM,
-// token bucket TPM, and concurrency control.
+// token bucket TPM, and concurrency control, plus a FIFO request queue.
 type RateLimiter struct {
 	mu      sync.Mutex
 	windows map[string]*slidingWindow
 	tokens  map[string]*tokenBucket
 	active  map[string]*int32
-	window  time.Duration
+	// queues holds each key's waiting queue. A request that cannot be admitted
+	// immediately is parked at the tail and granted at the head, in arrival
+	// order, when a slot frees or the RPM window rolls forward — the FIFO
+	// fairness the reference's queue provides, so a burst cannot starve an
+	// earlier caller.
+	queues map[string]*waitQueue
+	// windowTimers holds the per-key wake timers that fire when the RPM window
+	// rolls far enough to admit the head waiter. One timer per key, removed when
+	// it fires.
+	windowTimers map[string]*time.Timer
+	window       time.Duration
+	// maxKeys bounds every per-key map. Eviction prunes them together.
 	maxKeys int
+}
+
+// waitQueue is the FIFO of parked requests for one key.
+type waitQueue struct {
+	waiters []*waiter
+}
+
+// waiter is one parked request. grant is buffered(1) so a pump can hand over a
+// slot without blocking on a caller that has already timed out; the caller
+// closes the loop by re-checking whether it still holds the grant.
+type waiter struct {
+	grant chan struct{}
+	// rpm and concurrency are the limits this waiter is queued under. They are
+	// captured at enqueue so the pump admits the head against exactly the same
+	// limits the caller was refused under, rather than re-deriving them from a
+	// key whose configuration may have changed.
+	rpm         int
+	concurrency int
+	// done is set when the waiter gives up (timeout or cancellation), so the
+	// pump can discard it without granting.
+	done bool
 }
 
 type slidingWindow struct {
@@ -43,53 +75,339 @@ func NewRateLimiter(window time.Duration) *RateLimiter {
 		window = time.Minute
 	}
 	return &RateLimiter{
-		windows: make(map[string]*slidingWindow),
-		tokens:  make(map[string]*tokenBucket),
-		active:  make(map[string]*int32),
-		window:  window,
-		maxKeys: 10000,
+		windows:      make(map[string]*slidingWindow),
+		tokens:       make(map[string]*tokenBucket),
+		active:       make(map[string]*int32),
+		queues:       make(map[string]*waitQueue),
+		windowTimers: make(map[string]*time.Timer),
+		window:       window,
+		maxKeys:      10000,
 	}
 }
 
 // Check verifies if a request is allowed under the given limits.
-// Returns (allowed, retryAfterSec).
-func (rl *RateLimiter) Check(keyID string, rpm, tpm, concurrency int, promptTokens int) (bool, int) {
-	now := time.Now()
-
-	// Concurrency check
-	if concurrency > 0 {
-		if !rl.checkConcurrency(keyID, concurrency) {
-			return false, 1
+// Returns (allowed, retryAfterSec, scope), where scope names the axis that
+// refused the request ("rpm", "tpm", or "concurrency") and is empty when the
+// request was allowed. The scope is returned rather than re-derived so a metric
+// label reflects the limit that actually tripped.
+//
+// Check is the NON-blocking gate. It never queues; a caller that wants to wait
+// for a slot uses Acquire, which shares the same admit test.
+func (rl *RateLimiter) Check(keyID string, rpm, tpm, concurrency int, promptTokens int) (bool, int, string) {
+	// RPM and concurrency share the one admit test Acquire uses, so a key that
+	// Check refuses is exactly a key that would have to queue. The scope names
+	// which axis tripped, for the metric label.
+	if !rl.tryAdmit(keyID, rpm, concurrency) {
+		if concurrency > 0 && rl.concurrencyFull(keyID, concurrency) {
+			return false, 1, "concurrency"
 		}
+		return false, rl.rpmRetryAfter(keyID, time.Now()), "rpm"
 	}
 
-	// RPM check (sliding window)
-	if rpm > 0 {
-		if !rl.checkRPM(keyID, rpm, now) {
-			retryAfter := rl.rpmRetryAfter(keyID, now)
-			return false, retryAfter
-		}
-	}
-
-	// TPM check (token bucket)
+	// TPM is not part of admission: a token bucket is not queueable, so it is
+	// charged (and may refuse) separately after a slot is secured.
 	if tpm > 0 {
+		now := time.Now()
 		if !rl.checkTPM(keyID, tpm, promptTokens, now) {
-			retryAfter := rl.tpmRetryAfter(keyID, tpm, promptTokens)
-			return false, retryAfter
+			return false, rl.tpmRetryAfter(keyID, tpm, promptTokens), "tpm"
 		}
 	}
 
-	return true, 0
+	return true, 0, ""
 }
 
-// ReleaseConcurrency decrements the concurrency counter for a key.
+// concurrencyFull reports whether the concurrency axis is the one that blocked,
+// used only to label a refusal. Must be called with rl.mu held by tryAdmit's
+// caller having released it; it re-takes the lock for a consistent read.
+func (rl *RateLimiter) concurrencyFull(keyID string, limit int) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	counter, exists := rl.active[keyID]
+	return exists && counter != nil && atomic.LoadInt32(counter) >= int32(limit)
+}
+
+// ReleaseConcurrency decrements the concurrency counter for a key and then
+// advances the queue.
+//
+// The decrement happens under the lock, before the pump, so a waiter granted in
+// the same critical section observes a counter that already reflects this
+// release. Waking first would let the pump grant a slot that does not exist.
 func (rl *RateLimiter) ReleaseConcurrency(keyID string) {
 	rl.mu.Lock()
-	counter, exists := rl.active[keyID]
-	rl.mu.Unlock()
-	if exists && counter != nil {
-		atomic.AddInt32(counter, -1)
+	defer rl.mu.Unlock()
+	if counter, exists := rl.active[keyID]; exists && counter != nil {
+		if atomic.AddInt32(counter, -1) < 0 {
+			// Defensive: a double release must not make the count go negative,
+			// which would hand out a slot that was never held.
+			atomic.StoreInt32(counter, 0)
+		}
 	}
+	rl.pumpLocked(keyID)
+}
+
+// Acquire admits a request under the key's RPM and concurrency limits, waiting
+// in FIFO order for a slot when the key is saturated. It returns the time spent
+// waiting and whether a slot was granted.
+//
+// This is the queue the reference implements: a request that cannot be admitted
+// immediately is parked at the tail and granted at the head, in arrival order,
+// when a concurrency slot frees OR the RPM window rolls far enough forward to
+// admit it. A zero timeout preserves the pre-queue behaviour (try once, refuse),
+// so a key that never configured queueTimeoutMs is unchanged.
+//
+// TPM is not queueable: unlike an RPM window, a token bucket refills
+// continuously, so a waiter could be granted and immediately re-refuse forever.
+// Callers size TPM against the body before calling here; a TPM refusal is a 429
+// from Check, not a wait.
+func (rl *RateLimiter) Acquire(keyID string, rpm, concurrency int, timeout time.Duration) (waited time.Duration, ok bool) {
+	start := time.Now()
+
+	// Fast path: admit without queueing if both axes have room.
+	if rl.tryAdmit(keyID, rpm, concurrency) {
+		return 0, true
+	}
+	if timeout <= 0 {
+		return 0, false
+	}
+
+	w := &waiter{grant: make(chan struct{}, 1), rpm: rpm, concurrency: concurrency}
+	deadline := start.Add(timeout)
+
+	// Enqueue and re-check under one lock, so a release between the fast-path
+	// failure and the enqueue cannot be lost: either the pump sees us at the
+	// head and grants immediately, or it grants on the next free.
+	rl.mu.Lock()
+	rl.queueForLocked(keyID).waiters = append(rl.queueForLocked(keyID).waiters, w)
+	rl.pumpLocked(keyID)
+	rl.mu.Unlock()
+
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+
+	select {
+	case <-w.grant:
+		return time.Since(start), true
+	case <-timer.C:
+	}
+
+	// Timed out. Mark the waiter done and let the pump discard it. A grant may
+	// have raced in at the deadline; if it did, we are now holding a slot we
+	// will never use, so release it rather than leak it.
+	rl.mu.Lock()
+	w.done = true
+	select {
+	case <-w.grant:
+		// We were granted a slot as we gave up. Hand the concurrency slot
+		// back so the next waiter can have it; the RPM stamp is left spent,
+		// which is the safe direction (it can only delay, never over-admit).
+		if concurrency > 0 {
+			if counter := rl.active[keyID]; counter != nil {
+				atomic.AddInt32(counter, -1)
+			}
+		}
+	default:
+	}
+	rl.pumpLocked(keyID)
+	rl.mu.Unlock()
+	return time.Since(start), false
+}
+
+// tryAdmit atomically claims an RPM stamp and (if capped) a concurrency slot.
+// It is all-or-nothing: a request that gets the stamp but not the slot returns
+// false with the stamp already given back, so a refused request never consumes
+// part of the budget.
+func (rl *RateLimiter) tryAdmit(keyID string, rpm, concurrency int) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	return rl.tryAdmitLocked(keyID, rpm, concurrency)
+}
+
+// tryAdmitLocked is tryAdmit under an already-held lock. It also runs the RPM
+// window compaction, so it must be the single place a stamp is added.
+func (rl *RateLimiter) tryAdmitLocked(keyID string, rpm, concurrency int) bool {
+	now := time.Now()
+
+	// RPM: compact the window and test for room before touching the counter, so
+	// a full window costs nothing.
+	hasStamp := false
+	if rpm > 0 {
+		if !rl.windowHasRoomLocked(keyID, rpm, now) {
+			return false
+		}
+		hasStamp = true
+	}
+
+	// Concurrency: claim a slot if the key is capped.
+	claimedSlot := false
+	if concurrency > 0 {
+		counter := rl.activeCounterLocked(keyID)
+		if atomic.LoadInt32(counter) >= int32(concurrency) {
+			return false
+		}
+		atomic.AddInt32(counter, 1)
+		claimedSlot = true
+	}
+
+	// Commit: only now that both axes are secured do we consume the stamp. Doing
+	// it here rather than above is what makes the decision atomic — a request
+	// refused on concurrency leaves the RPM window untouched.
+	if hasStamp {
+		rl.recordStampLocked(keyID, now)
+	}
+	_ = claimedSlot
+	return true
+}
+
+// windowHasRoomLocked reports whether the key's RPM window has room for one more
+// request, compacting expired stamps as a side effect.
+func (rl *RateLimiter) windowHasRoomLocked(keyID string, rpm int, now time.Time) bool {
+	window := rl.windowForLocked(keyID)
+	cutoff := now.Add(-rl.window)
+	valid := window.stamps[:0]
+	for _, t := range window.stamps {
+		if t.After(cutoff) {
+			valid = append(valid, t)
+		}
+	}
+	window.stamps = valid
+	return len(window.stamps) < rpm
+}
+
+// recordStampLocked appends a request stamp to the key's window.
+func (rl *RateLimiter) recordStampLocked(keyID string, now time.Time) {
+	rl.evictIfNeededLocked()
+	window := rl.windowForLocked(keyID)
+	window.stamps = append(window.stamps, now)
+}
+
+func (rl *RateLimiter) windowForLocked(keyID string) *slidingWindow {
+	window, exists := rl.windows[keyID]
+	if !exists {
+		window = &slidingWindow{}
+		rl.windows[keyID] = window
+	}
+	return window
+}
+
+func (rl *RateLimiter) activeCounterLocked(keyID string) *int32 {
+	counter, exists := rl.active[keyID]
+	if !exists {
+		counter = new(int32)
+		rl.active[keyID] = counter
+	}
+	return counter
+}
+
+func (rl *RateLimiter) queueForLocked(keyID string) *waitQueue {
+	q, exists := rl.queues[keyID]
+	if !exists {
+		q = &waitQueue{}
+		rl.queues[keyID] = q
+	}
+	return q
+}
+
+// pumpLocked grants slots to parked waiters, head first, for as long as the
+// key can admit them. It must run under rl.mu and is called whenever a resource
+// frees (a concurrency release) or time passes (the RPM window rolling).
+func (rl *RateLimiter) pumpLocked(keyID string) {
+	q, exists := rl.queues[keyID]
+	if !exists {
+		return
+	}
+	now := time.Now()
+
+	for len(q.waiters) > 0 {
+		head := q.waiters[0]
+
+		// Discard a caller that already gave up (timed out or cancelled).
+		if head.done {
+			q.waiters = q.waiters[1:]
+			continue
+		}
+
+		// Test the head against the limits it was queued under, so a waiter
+		// and a fresh caller cannot disagree about whether a slot exists.
+		if !rl.tryAdmitLockedForWaiter(keyID, head.rpm, head.concurrency) {
+			// The head cannot be admitted; FIFO means nobody behind it may
+			// overtake. Wake again only when TIME can help — i.e. when the RPM
+			// window is what is blocking. A concurrency block clears on
+			// ReleaseConcurrency, which calls back into the pump, so scheduling
+			// a timer for it would only spin until the timeout.
+			if rl.rpmBlockedLocked(keyID, head.rpm, now) {
+				rl.scheduleWindowWakeLocked(keyID, now)
+			}
+			return
+		}
+
+		q.waiters = q.waiters[1:]
+		// Non-blocking hand-off: the buffer holds the grant for a caller that
+		// is between timeout and re-acquire.
+		select {
+		case head.grant <- struct{}{}:
+		default:
+		}
+	}
+
+	// Queue drained; drop the empty entry so eviction can reclaim the key.
+	if len(q.waiters) == 0 {
+		delete(rl.queues, keyID)
+	}
+}
+
+// rpmBlockedLocked reports whether the RPM window is what is holding the head
+// waiter back, as opposed to concurrency. Only an RPM block is time-resolved; a
+// concurrency block clears on release, so it needs no timer. Must run under
+// rl.mu.
+func (rl *RateLimiter) rpmBlockedLocked(keyID string, rpm int, now time.Time) bool {
+	if rpm <= 0 {
+		return false
+	}
+	window := rl.windows[keyID]
+	if window == nil {
+		return false
+	}
+	cutoff := now.Add(-rl.window)
+	live := 0
+	for _, t := range window.stamps {
+		if t.After(cutoff) {
+			live++
+		}
+	}
+	return live >= rpm
+}
+
+// tryAdmitLockedForWaiter is tryAdmitLocked for a parked waiter, reusing the
+// same admit rules so a waiter and a fresh caller cannot disagree about whether
+// a slot exists.
+func (rl *RateLimiter) tryAdmitLockedForWaiter(keyID string, rpm, concurrency int) bool {
+	return rl.tryAdmitLocked(keyID, rpm, concurrency)
+}
+
+// scheduleWindowWakeLocked arranges a pump when the head waiter's RPM wait could
+// clear. It is a best-effort timer: a wake that fires early simply re-pumps and
+// reschedules. The window timer is keyed and replaced so repeated pumps do not
+// pile up timers.
+func (rl *RateLimiter) scheduleWindowWakeLocked(keyID string, now time.Time) {
+	window := rl.windows[keyID]
+	if window == nil || len(window.stamps) == 0 {
+		return
+	}
+	if _, exists := rl.windowTimers[keyID]; exists {
+		return
+	}
+	oldest := window.stamps[0]
+	wakeIn := oldest.Add(rl.window).Sub(now)
+	if wakeIn <= 0 {
+		wakeIn = time.Millisecond
+	}
+	timer := time.AfterFunc(wakeIn, func() {
+		rl.mu.Lock()
+		delete(rl.windowTimers, keyID)
+		rl.pumpLocked(keyID)
+		rl.mu.Unlock()
+	})
+	rl.windowTimers[keyID] = timer
 }
 
 // SettleTokenUsage reconciles a reservation against what the turn actually cost.
@@ -118,36 +436,6 @@ func (rl *RateLimiter) SettleTokenUsage(keyID string, tpm, reserved, actual int)
 	if bucket.tokens < 0 {
 		bucket.tokens = 0
 	}
-}
-
-func (rl *RateLimiter) checkRPM(keyID string, rpm int, now time.Time) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	rl.evictIfNeeded()
-
-	window, exists := rl.windows[keyID]
-	if !exists {
-		window = &slidingWindow{}
-		rl.windows[keyID] = window
-	}
-
-	// Remove timestamps outside the window
-	cutoff := now.Add(-rl.window)
-	valid := window.stamps[:0]
-	for _, t := range window.stamps {
-		if t.After(cutoff) {
-			valid = append(valid, t)
-		}
-	}
-	window.stamps = valid
-
-	if len(window.stamps) >= rpm {
-		return false
-	}
-
-	window.stamps = append(window.stamps, now)
-	return true
 }
 
 func (rl *RateLimiter) rpmRetryAfter(keyID string, now time.Time) int {
@@ -218,35 +506,64 @@ func (rl *RateLimiter) tpmRetryAfter(keyID string, tpm int, tokens int) int {
 	return int(retryAfter) + 1
 }
 
-func (rl *RateLimiter) checkConcurrency(keyID string, maxConcurrent int) bool {
-	rl.mu.Lock()
-	counter, exists := rl.active[keyID]
-	if !exists {
-		c := new(int32)
-		rl.active[keyID] = c
-		counter = c
-	}
-	rl.mu.Unlock()
-
-	current := atomic.AddInt32(counter, 1)
-	if current > int32(maxConcurrent) {
-		atomic.AddInt32(counter, -1)
-		return false
-	}
-	return true
-}
-
-func (rl *RateLimiter) evictIfNeeded() {
+// evictIfNeededLocked bounds the per-key state so a fleet that mints a key per
+// caller cannot grow the limiter's maps without limit. It uses the RPM window
+// map's size as the trigger, because that is the map every rate-limited request
+// touches, then drops matching entries from every map the same key could occupy
+// (window, TPM bucket, concurrency counter, wake channel).
+//
+// The one entry it never drops is a key that currently holds a concurrency
+// slot: removing its counter or its wake channel would either lose a slot (the
+// count restarts at zero while the request is still running) or strand a
+// parked waiter. An in-flight key is by definition recent, so skipping it
+// cannot defeat the bound — the next call evicts it once it drains.
+//
+// Must be called with rl.mu held.
+func (rl *RateLimiter) evictIfNeededLocked() {
 	if len(rl.windows) < rl.maxKeys {
 		return
 	}
-	// Simple eviction: clear oldest 10% of keys
+	target := rl.maxKeys * 9 / 10
 	for k := range rl.windows {
+		if rl.keyBusy(k) {
+			continue
+		}
+		// A key with parked waiters is not idle: dropping its queue or wake
+		// timer would strand those callers. They hold no concurrency slot, so
+		// keyBusy does not cover them; skip them explicitly.
+		if q, ok := rl.queues[k]; ok && len(q.waiters) > 0 {
+			continue
+		}
 		delete(rl.windows, k)
-		if len(rl.windows) < rl.maxKeys*9/10 {
+		delete(rl.tokens, k)
+		delete(rl.active, k)
+		delete(rl.queues, k)
+		if timer, ok := rl.windowTimers[k]; ok {
+			timer.Stop()
+			delete(rl.windowTimers, k)
+		}
+		if len(rl.windows) <= target {
 			break
 		}
 	}
+}
+
+// keyBusy reports whether a key currently holds a concurrency slot. Must be
+// called with rl.mu held.
+func (rl *RateLimiter) keyBusy(keyID string) bool {
+	counter, exists := rl.active[keyID]
+	if !exists || counter == nil {
+		return false
+	}
+	return atomic.LoadInt32(counter) > 0
+}
+
+// TokenUsageReader reports a key's cumulative prompt+completion tokens, which
+// is what a lifetime tokenQuota is measured against. It is a narrow interface
+// so the limiter does not bind to the repository and a test can supply a fixed
+// number without a database.
+type TokenUsageReader interface {
+	GetApiKeyTokenUsage(rawKey string) (int, error)
 }
 
 // RequireRateLimit creates a middleware that enforces per-key rate limits.
@@ -255,7 +572,15 @@ func (rl *RateLimiter) evictIfNeeded() {
 // once here to size it and then handed to the next handler intact. Reading it
 // unconditionally would buffer large uploads for every request, so it is only
 // read when a TPM limit is actually configured.
-func RequireRateLimit(rl *RateLimiter, defaults Defaults) func(http.Handler) http.Handler {
+//
+// Order matters. The lifetime quota is a hard budget refused before anything
+// else. TPM is a continuous refill and is NOT queueable, so it is charged and
+// may refuse outright. RPM and concurrency are both queueable: a request waits
+// in the key's FIFO queue, up to queueTimeoutMs, for the window to roll or a
+// concurrent slot to free. A key with no queue timeout configured keeps the
+// pre-queue behaviour (refuse immediately), because Acquire tries once when the
+// timeout is zero.
+func RequireRateLimit(rl *RateLimiter, defaults Defaults, usage TokenUsageReader) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			apiKey := GetAuthenticatedApiKey(r)
@@ -265,33 +590,113 @@ func RequireRateLimit(rl *RateLimiter, defaults Defaults) func(http.Handler) htt
 			}
 
 			limits := limitsFor(apiKey, defaults)
-			promptTokens := 0
-			if limits.TPM > 0 {
-				promptTokens = promptTokensForRequest(r)
-			}
 
-			allowed, retryAfter := rl.Check(apiKey.ID, limits.RPM, limits.TPM, limits.Concurrency, promptTokens)
-			if !allowed {
-				rejectRateLimited(w, apiKey.ID, limits, retryAfter)
+			// Lifetime token quota: a hard budget, refused with 403 the same way
+			// a not-yet-ported plan-tier cap would be. It is checked before
+			// RPM/TPM because an exhausted key must not consume a slot or a
+			// request stamp on its way to being told no.
+			if quotaCheck(w, r, apiKey, limits, usage) {
 				return
 			}
 
-			// Release concurrency after request completes
-			if limits.Concurrency > 0 {
-				defer rl.ReleaseConcurrency(apiKey.ID)
+			// TPM is charged up front and is not queueable: a token bucket
+			// refills continuously, so a queued request could be admitted and
+			// immediately re-refused forever. It is checked before the queue so
+			// an oversized prompt is refused without waiting at all.
+			if limits.TPM > 0 {
+				promptTokens := promptTokensForRequest(r)
+				if allowed, retryAfter, scope := rl.checkTPMOnly(apiKey.ID, limits.TPM, promptTokens); !allowed {
+					rejectRateLimited(w, apiKey.ID, limits, retryAfter, scope)
+					return
+				}
+				r = r.WithContext(withReservedTokens(r.Context(), promptTokens))
 			}
 
-			// A TPM charge is an estimate; the meter reconciles it once the real
-			// usage is known. The reservation travels on the context so the
-			// settle hook is only installed for requests that were actually
-			// charged.
-			if limits.TPM > 0 {
-				r = r.WithContext(withReservedTokens(r.Context(), promptTokens))
+			// RPM + concurrency: admit now if there is room, otherwise wait in
+			// FIFO order up to the key's queue timeout.
+			waited, ok := rl.Acquire(apiKey.ID, limits.RPM, limits.Concurrency, limits.QueueTimeout)
+			if !ok {
+				rejectRateLimited(w, apiKey.ID, limits, queueRetryAfter(limits), queueScope(limits))
+				return
+			}
+			if waited > 0 {
+				observ.ObserveRateLimitQueueWait(waited.Seconds())
+			}
+			if limits.Concurrency > 0 {
+				defer rl.ReleaseConcurrency(apiKey.ID)
 			}
 
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// checkTPMOnly charges the token bucket and names the refusal when it is full.
+// It is separate from Check so the middleware can run TPM before the queue: a
+// TPM refusal must not park the request first.
+func (rl *RateLimiter) checkTPMOnly(keyID string, tpm, tokens int) (bool, int, string) {
+	now := time.Now()
+	if rl.checkTPM(keyID, tpm, tokens, now) {
+		return true, 0, ""
+	}
+	return false, rl.tpmRetryAfter(keyID, tpm, tokens), "tpm"
+}
+
+// queueScope names which axis a queue timeout was waiting on, for the metric
+// label. When both are capped, concurrency is the likelier cause of a wait, but
+// the label is only a hint; the Retry-After carries the actionable value.
+func queueScope(limits Limits) string {
+	if limits.Concurrency > 0 {
+		return "concurrency"
+	}
+	return "rpm"
+}
+
+// quotaCheck refuses a key whose lifetime token budget is spent. It returns
+// true when the request was written a 403 and the handler must stop.
+//
+// A failed quota read allows the request: a storage blip must not lock a key
+// out of a service it has always been able to call, which mirrors how a failed
+// allowlist read degrades to "allow all". The quota is a spend ceiling, not an
+// access grant, so failing open costs at most a delayed enforcement.
+func quotaCheck(w http.ResponseWriter, r *http.Request, apiKey *models.APIKey, limits Limits, usage TokenUsageReader) bool {
+	if limits.TokenQuota <= 0 || usage == nil || apiKey.Key == "" {
+		return false
+	}
+	used, err := usage.GetApiKeyTokenUsage(apiKey.Key)
+	if err != nil {
+		log.Warn("rate limit", "token quota read failed, allowing", "key", apiKey.ID, "error", err)
+		return false
+	}
+	if used < limits.TokenQuota {
+		return false
+	}
+	log.Warn("rate limit", "token quota exhausted", "key", apiKey.ID, "used", used, "quota", limits.TokenQuota)
+	observ.IncRateLimitReject("token_quota", apiKey.ID)
+	rejectQuotaExhausted(w, used, limits.TokenQuota)
+	return true
+}
+
+// queueRetryAfter is the Retry-After for a request that timed out waiting for a
+// concurrency slot. The wait is bounded by the key's own timeout, so that is
+// the honest answer: retrying sooner only means parking again for the same span.
+func queueRetryAfter(limits Limits) int {
+	if limits.QueueTimeout <= 0 {
+		return 1
+	}
+	return int(limits.QueueTimeout.Seconds()) + 1
+}
+
+// rejectQuotaExhausted answers a key that has spent its lifetime token budget.
+//
+// A quota is not a per-window rate, so the answer is a plain 403 with the spend
+// it reached: Retry-After and X-RateLimit-Reset would both promise that waiting
+// helps, and for a lifetime budget only an operator raising the quota does.
+func rejectQuotaExhausted(w http.ResponseWriter, used, quota int) {
+	w.Header().Set("X-Token-Quota-Limit", strconv.Itoa(quota))
+	w.Header().Set("X-Token-Quota-Used", strconv.Itoa(used))
+	handlerutil.WriteJSONError(w, http.StatusForbidden,
+		fmt.Sprintf("Token quota exhausted for this API key (%d/%d).", used, quota))
 }
 
 // EffectiveTPM returns the TPM limit that applies to a key, resolving the
@@ -357,6 +762,13 @@ type Limits struct {
 	RPM         int
 	TPM         int
 	Concurrency int
+	// TokenQuota caps the key's cumulative prompt+completion tokens. It is
+	// enforced before dispatch and is not a per-window rate: it only ever
+	// decreases the key's remaining budget.
+	TokenQuota int
+	// QueueTimeout is how long a request may wait for a free concurrency slot
+	// before it is refused instead of served.
+	QueueTimeout time.Duration
 }
 
 // limitsFor resolves the effective limits for a key.
@@ -383,8 +795,29 @@ func limitsFor(apiKey *models.APIKey, d Defaults) Limits {
 	if v := derefInt(apiKey.RateLimitConcurrency); v > 0 {
 		out.Concurrency = v
 	}
+	// The quota is a lifetime budget, so it is never taken from the global
+	// fallback: a default token quota would silently cap every key in the
+	// install, which is not what a per-key rate default means.
+	if v := derefInt(apiKey.TokenQuota); v > 0 {
+		out.TokenQuota = v
+	}
+	// The queue timeout only matters when a concurrency cap exists; a key with
+	// no cap never queues, so its timeout is left untouched.
+	if out.Concurrency > 0 {
+		out.QueueTimeout = DefaultQueueTimeout
+	}
+	if v := derefInt(apiKey.QueueTimeoutMs); v > 0 {
+		out.QueueTimeout = time.Duration(v) * time.Millisecond
+	}
 	return out
 }
+
+// DefaultQueueTimeout is how long a request waits for a free concurrency slot
+// when the key does not set its own queueTimeoutMs. It matches the upstream
+// reference's own 60s fallback, so a key that only sets a concurrency cap
+// behaves the same on both gateways rather than being refused on the first
+// collision here.
+const DefaultQueueTimeout = 60 * time.Second
 
 func derefInt(v *int) int {
 	if v == nil {
@@ -399,9 +832,9 @@ func derefInt(v *int) int {
 // because a key can be bounded on three independent axes at once and a client
 // that has to guess cannot back off correctly. X-RateLimit-Limit still carries
 // RPM for the clients that only read the standard name.
-func rejectRateLimited(w http.ResponseWriter, keyID string, limits Limits, retryAfter int) {
-	log.Warn("rate limit", "key", keyID, "retryAfter", retryAfter)
-	observ.IncRateLimitReject(rateLimitScope(limits), keyID)
+func rejectRateLimited(w http.ResponseWriter, keyID string, limits Limits, retryAfter int, scope string) {
+	log.Warn("rate limit", "key", keyID, "retryAfter", retryAfter, "scope", scope)
+	observ.IncRateLimitReject(rateLimitScope(scope), keyID)
 
 	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 	if limits.RPM > 0 {
@@ -422,14 +855,16 @@ func rejectRateLimited(w http.ResponseWriter, keyID string, limits Limits, retry
 }
 
 // rateLimitScope names which axis refused the request, for the metric label.
-// The label is bounded to these five values so a key id can never become a
-// metric cardinality explosion.
-func rateLimitScope(l Limits) string {
-	switch {
-	case l.Concurrency > 0 && l.RPM == 0 && l.TPM == 0:
-		return "concurrency"
-	case l.TPM > 0 && l.RPM == 0:
-		return "tpm"
+//
+// The label is a closed vocabulary of five values, so a key id can never become
+// a metric cardinality explosion. The caller passes the axis it actually
+// refused on: inferring it from the Limits here mislabelled a concurrency-queue
+// timeout as "rpm" whenever the key also had an RPM cap, which is exactly the
+// common case and would have hidden queue pressure behind the wrong series.
+func rateLimitScope(scope string) string {
+	switch scope {
+	case "rpm", "tpm", "concurrency", "token_quota":
+		return scope
 	default:
 		return "rpm"
 	}

@@ -271,6 +271,10 @@ var goOnlyColumns = [][3]string{
 	{"apiKeys", "rateLimitRPM", "INTEGER DEFAULT 0"},
 	{"apiKeys", "rateLimitTPM", "INTEGER DEFAULT 0"},
 	{"apiKeys", "rateLimitConcurrency", "INTEGER DEFAULT 0"},
+	// F-1b Budget & queue: cumulative token quota and how long a request may
+	// wait for a concurrency slot before it is refused.
+	{"apiKeys", "tokenQuota", "INTEGER DEFAULT 0"},
+	{"apiKeys", "queueTimeoutMs", "INTEGER DEFAULT 0"},
 	// F-6 Argon2id key hashing
 	{"apiKeys", "keyHash", "TEXT DEFAULT ''"},
 	{"apiKeys", "lookupHash", "TEXT DEFAULT ''"},

@@ -495,7 +495,9 @@ func (h *DashboardHandler) exportDatabase() (*databaseExport, error) {
 	}
 
 	if out.APIKeys, err = selectRows(db,
-		`SELECT id, key, name, machineId, isActive, createdAt FROM apiKeys`); err != nil {
+		`SELECT id, key, name, machineId, isActive, createdAt,
+		        rateLimitRPM, rateLimitTPM, rateLimitConcurrency, tokenQuota, queueTimeoutMs
+		   FROM apiKeys`); err != nil {
 		return nil, err
 	}
 	// The per-key model allowlist is a separate table, so selecting apiKeys
@@ -659,9 +661,19 @@ func (h *DashboardHandler) importDatabase(payload map[string]any) error {
 			continue
 		}
 		if _, err := tx.Exec(
-			`INSERT OR REPLACE INTO apiKeys(id, key, name, machineId, isActive, createdAt) VALUES(?, ?, ?, ?, ?, ?)`,
+			`INSERT OR REPLACE INTO apiKeys(id, key, name, machineId, isActive, createdAt,
+			        rateLimitRPM, rateLimitTPM, rateLimitConcurrency, tokenQuota, queueTimeoutMs)
+			 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			k["id"], k["key"], stringDefault(k["name"], nil), stringDefault(k["machineId"], nil),
 			boolToInt(k["isActive"]), stringDefault(k["createdAt"], nowISO()),
+			// A restored key must come back with the limits it had: a backup
+			// that silently lifted every rate limit and token quota would turn
+			// disaster recovery into an accidental opening of the throttle.
+			// Missing columns coerce to 0 (unlimited), which is the same
+			// meaning an absent column has on the live row.
+			intDefault(k["rateLimitRPM"], 0), intDefault(k["rateLimitTPM"], 0),
+			intDefault(k["rateLimitConcurrency"], 0), intDefault(k["tokenQuota"], 0),
+			intDefault(k["queueTimeoutMs"], 0),
 		); err != nil {
 			return err
 		}
@@ -913,4 +925,27 @@ func stringDefault(v any, fallback any) any {
 // nowISO returns a UTC RFC3339 timestamp for rows missing one.
 func nowISO() string {
 	return time.Now().UTC().Format(time.RFC3339)
+}
+
+// intDefault coerces a backup value to a whole non-negative count, returning
+// fallback for anything else. JSON has one number type (float64), so a
+// hand-edited or older backup can arrive as a float, a string, or nothing at
+// all; an unparseable limit restores as its fallback (0 = unlimited) rather
+// than failing the whole restore over one column.
+func intDefault(v any, fallback int) int {
+	switch t := v.(type) {
+	case float64:
+		if t >= 0 {
+			return int(t)
+		}
+	case int:
+		if t >= 0 {
+			return t
+		}
+	case int64:
+		if t >= 0 {
+			return int(t)
+		}
+	}
+	return fallback
 }

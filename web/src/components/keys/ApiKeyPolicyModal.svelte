@@ -15,6 +15,11 @@
   let rpm = $state(apiKey.rateLimitRpm ?? 0)
   let tpm = $state(apiKey.rateLimitTpm ?? 0)
   let concurrency = $state(apiKey.rateLimitConcurrency ?? 0)
+  // The lifetime budget and the concurrency wait are the two governance columns
+  // the modal gained alongside the per-window rates. Both read 0 as "unset":
+  // no quota, and the server's default queue timeout.
+  let tokenQuota = $state(apiKey.tokenQuota ?? 0)
+  let queueTimeoutMs = $state(apiKey.queueTimeoutMs ?? 0)
 
   // expiresAt is stored as RFC3339. The input is a plain datetime-local because
   // the browser needs a local time and the server needs UTC; convert at the edge
@@ -118,6 +123,8 @@
         rateLimitRpm: nonNegative(rpm),
         rateLimitTpm: nonNegative(tpm),
         rateLimitConcurrency: nonNegative(concurrency),
+        tokenQuota: nonNegative(tokenQuota),
+        queueTimeoutMs: nonNegative(queueTimeoutMs),
         expiresAt: toRFC3339(expiresLocal),
         metadata: metadataValue,
         name: name.trim(),
@@ -242,6 +249,43 @@
               bind:value={concurrency}
               class="w-full bg-surface border border-border rounded-lg px-3 py-2 font-code text-xs text-text-main focus:outline-none focus:border-brand-500"
             />
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label for="pol-quota" class="block font-semibold text-text-muted mb-1">
+              Lifetime token quota
+            </label>
+            <input
+              id="pol-quota"
+              type="number"
+              min="0"
+              step="1"
+              bind:value={tokenQuota}
+              class="w-full bg-surface border border-border rounded-lg px-3 py-2 font-code text-xs text-text-main focus:outline-none focus:border-brand-500"
+            />
+            <p class="text-text-subtle mt-1">
+              Total prompt + completion tokens for the key's lifetime. Once spent, requests are
+              refused with 403.
+            </p>
+          </div>
+          <div>
+            <label for="pol-queue" class="block font-semibold text-text-muted mb-1">
+              Queue timeout (ms)
+            </label>
+            <input
+              id="pol-queue"
+              type="number"
+              min="0"
+              step="1"
+              bind:value={queueTimeoutMs}
+              class="w-full bg-surface border border-border rounded-lg px-3 py-2 font-code text-xs text-text-main focus:outline-none focus:border-brand-500"
+            />
+            <p class="text-text-subtle mt-1">
+              How long a request waits for a free concurrency slot before it is refused with 429.
+              Leave 0 for the server default.
+            </p>
           </div>
         </div>
       </section>

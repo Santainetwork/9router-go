@@ -518,7 +518,7 @@ func SetupServerRouter(r chi.Router, repo *db.Repo, ts *TokenSaverConfig) {
 	var engineChatH *chat.ChatHandler
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.RequireApiKey(repo))
-		r.Use(middleware.RequireRateLimit(rateLimiter, defaults))
+		r.Use(middleware.RequireRateLimit(rateLimiter, defaults, repo))
 		r.Use(guardrails.Inbound(guardrailStore, guardrailAudit(repo), guardrailSwitch))
 		engineChatH = SetupRoutes(r, repo, ts)
 	})

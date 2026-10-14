@@ -64,6 +64,12 @@ type APIKey struct {
 	RateLimitRPM         *int `json:"rateLimitRpm,omitempty"`
 	RateLimitTPM         *int `json:"rateLimitTpm,omitempty"`
 	RateLimitConcurrency *int `json:"rateLimitConcurrency,omitempty"`
+	// F-1b Budget & queue. TokenQuota caps the key's cumulative
+	// prompt+completion tokens across its lifetime (0 = unlimited).
+	// QueueTimeoutMs is how long a request waits for a free concurrency slot
+	// before it is refused; 0 falls back to the server default.
+	TokenQuota     *int `json:"tokenQuota,omitempty"`
+	QueueTimeoutMs *int `json:"queueTimeoutMs,omitempty"`
 	// F-6 Argon2id hashing
 	KeyHash    *string `json:"keyHash,omitempty"`
 	LookupHash *string `json:"lookupHash,omitempty"`

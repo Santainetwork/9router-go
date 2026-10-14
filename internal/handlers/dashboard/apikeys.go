@@ -45,6 +45,8 @@ func (h *DashboardHandler) HandleGetApiKeys(w http.ResponseWriter, r *http.Reque
 			"rateLimitRpm":         intOrZero(k.RateLimitRPM),
 			"rateLimitTpm":         intOrZero(k.RateLimitTPM),
 			"rateLimitConcurrency": intOrZero(k.RateLimitConcurrency),
+			"tokenQuota":           intOrZero(k.TokenQuota),
+			"queueTimeoutMs":       intOrZero(k.QueueTimeoutMs),
 			"expiresAt":            stringOrEmpty(k.ExpiresAt),
 			"lastUsedAt":           stringOrEmpty(k.LastUsedAt),
 			"usedCount":            intOrZero(k.UsedCount),

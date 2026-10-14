@@ -48,6 +48,8 @@ func (h *DashboardHandler) HandleUpdateApiKey(w http.ResponseWriter, r *http.Req
 		RateLimitRPM         *int    `json:"rateLimitRpm"`
 		RateLimitTPM         *int    `json:"rateLimitTpm"`
 		RateLimitConcurrency *int    `json:"rateLimitConcurrency"`
+		TokenQuota           *int    `json:"tokenQuota"`
+		QueueTimeoutMs       *int    `json:"queueTimeoutMs"`
 		ExpiresAt            *string `json:"expiresAt"`
 		Metadata             *string `json:"metadata"`
 		// Renaming a key. `name` is a pointer so an omitted field leaves the
@@ -91,8 +93,22 @@ func (h *DashboardHandler) HandleUpdateApiKey(w http.ResponseWriter, r *http.Req
 		handlerutil.WriteJSONError(w, http.StatusBadRequest, "rateLimitConcurrency: "+err.Error())
 		return
 	}
+	quota, err := mergeLimit(req.TokenQuota, existing.TokenQuota)
+	if err != nil {
+		handlerutil.WriteJSONError(w, http.StatusBadRequest, "tokenQuota: "+err.Error())
+		return
+	}
+	queueMs, err := mergeLimit(req.QueueTimeoutMs, existing.QueueTimeoutMs)
+	if err != nil {
+		handlerutil.WriteJSONError(w, http.StatusBadRequest, "queueTimeoutMs: "+err.Error())
+		return
+	}
 
 	if err := h.Repo.SetApiKeyRateLimit(id, rpm, tpm, conc); err != nil {
+		handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := h.Repo.SetApiKeyBudget(id, quota, queueMs); err != nil {
 		handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -144,6 +160,7 @@ func (h *DashboardHandler) HandleUpdateApiKey(w http.ResponseWriter, r *http.Req
 		"id":     id,
 		"limits": map[string]int{
 			"rpm": rpm, "tpm": tpm, "concurrency": conc,
+			"tokenQuota": quota, "queueTimeoutMs": queueMs,
 		},
 	})
 }
