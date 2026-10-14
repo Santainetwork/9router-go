@@ -96,10 +96,10 @@ func TestRequireRateLimitChargesRealTokens(t *testing.T) {
 		body := `{"model":"gpt-4o","messages":[{"role":"user","content":"` + content + `"}]}`
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 		req = req.WithContext(withAPIKey(req, &models.APIKey{
-			ID:                    "k1",
-			RateLimitRPM:          new(0),
-			RateLimitTPM:          new(40),
-			RateLimitConcurrency:  new(0),
+			ID:                   "k1",
+			RateLimitRPM:         new(0),
+			RateLimitTPM:         new(40),
+			RateLimitConcurrency: new(0),
 		}))
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)

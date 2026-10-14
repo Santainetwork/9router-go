@@ -23,7 +23,13 @@
   leaves the stored value unchanged), shown in the key policy dialog with a
   quota badge, and carried through database backup/restore so a restore cannot
   silently lift a throttle. Schema columns are additive; existing installs
-  upgrade in place.
+  upgrade in place, and `usageHistory` gains an `apiKey` index so the quota
+  sum is not a full table scan on every quota-bearing request.
+- **No behaviour change for an existing install.** A key with no
+  `queueTimeoutMs` of its own only queues when it also has its own concurrency
+  cap (the upstream 60s default). A concurrency cap that arrives purely from
+  the operator's global default keeps the pre-change immediate refusal, so a
+  global setting cannot silently introduce queueing on every key.
 - Verified: `go build ./...`, `go vet ./internal/...`, and `go test -count=1
   ./internal/...` all pass; new queue/quota/schema/backup/full-stack tests pass
   under `-race`.

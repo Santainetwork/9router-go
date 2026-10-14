@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,7 +18,7 @@ func TestQueueNoLostWakeupHammer(t *testing.T) {
 		rl := NewRateLimiter(time.Minute)
 		const key = "hammer"
 
-		if _, ok := rl.Acquire(key, 0, 1, 0); !ok {
+		if _, ok := rl.Acquire(context.Background(), key, 0, 1, 0); !ok {
 			t.Fatalf("round %d: initial acquire failed", r)
 		}
 
@@ -27,7 +28,7 @@ func TestQueueNoLostWakeupHammer(t *testing.T) {
 			// at the deadline, but far slower than the release that should have
 			// freed it. We measure the wait to catch that.
 			start := time.Now()
-			_, ok := rl.Acquire(key, 0, 1, 2*time.Second)
+			_, ok := rl.Acquire(context.Background(), key, 0, 1, 2*time.Second)
 			elapsed := time.Since(start)
 			got <- ok && elapsed < 500*time.Millisecond
 		}()
@@ -54,7 +55,7 @@ func TestQueueWaitDoesNotBlockOtherCallers(t *testing.T) {
 	rl := NewRateLimiter(time.Minute)
 
 	// Saturate A so its next acquire parks.
-	if _, ok := rl.Acquire("A", 0, 1, 0); !ok {
+	if _, ok := rl.Acquire(context.Background(), "A", 0, 1, 0); !ok {
 		t.Fatal("A failed to acquire")
 	}
 
@@ -62,7 +63,7 @@ func TestQueueWaitDoesNotBlockOtherCallers(t *testing.T) {
 	go func() {
 		close(parked)
 		// This blocks until its 50ms timeout, holding no lock.
-		rl.Acquire("A", 0, 1, 50*time.Millisecond)
+		rl.Acquire(context.Background(), "A", 0, 1, 50*time.Millisecond)
 	}()
 	<-parked
 	// Give the goroutine a moment to actually enter the wait.
@@ -70,7 +71,7 @@ func TestQueueWaitDoesNotBlockOtherCallers(t *testing.T) {
 
 	// B must acquire instantly, unaffected by A's parked waiter.
 	start := time.Now()
-	if _, ok := rl.Acquire("B", 0, 1, 0); !ok {
+	if _, ok := rl.Acquire(context.Background(), "B", 0, 1, 0); !ok {
 		t.Fatal("B blocked behind A's parked waiter — the lock is held during the wait")
 	}
 	if elapsed := time.Since(start); elapsed > 25*time.Millisecond {
@@ -97,7 +98,7 @@ func TestQueueSoakNoSlotLeak(t *testing.T) {
 			defer wg.Done()
 			for c := 0; c < cycles; c++ {
 				key := "soak-" + itoaSmall((seed+c)%keys)
-				if _, ok := rl.Acquire(key, 0, cap, 5*time.Second); !ok {
+				if _, ok := rl.Acquire(context.Background(), key, 0, cap, 5*time.Second); !ok {
 					t.Errorf("acquire failed for %s", key)
 					return
 				}

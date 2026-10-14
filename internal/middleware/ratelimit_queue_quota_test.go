@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -19,7 +20,7 @@ func TestAcquireQueuesUntilSlotFrees(t *testing.T) {
 	rl := NewRateLimiter(time.Minute)
 
 	// Fill the single slot.
-	if _, ok := rl.Acquire("k", 0, 1, 0); !ok {
+	if _, ok := rl.Acquire(context.Background(), "k", 0, 1, 0); !ok {
 		t.Fatal("first acquire should win the only slot")
 	}
 
@@ -27,7 +28,7 @@ func TestAcquireQueuesUntilSlotFrees(t *testing.T) {
 	// first is released.
 	done := make(chan bool, 1)
 	go func() {
-		_, ok := rl.Acquire("k", 0, 1, 2*time.Second)
+		_, ok := rl.Acquire(context.Background(), "k", 0, 1, 2*time.Second)
 		done <- ok
 	}()
 
@@ -49,12 +50,12 @@ func TestAcquireQueuesUntilSlotFrees(t *testing.T) {
 // with no release coming, the request is refused rather than held forever.
 func TestAcquireTimesOutWhenNoSlotFrees(t *testing.T) {
 	rl := NewRateLimiter(time.Minute)
-	if _, ok := rl.Acquire("k", 0, 1, 0); !ok {
+	if _, ok := rl.Acquire(context.Background(), "k", 0, 1, 0); !ok {
 		t.Fatal("first acquire should win the only slot")
 	}
 
 	start := time.Now()
-	_, ok := rl.Acquire("k", 0, 1, 60*time.Millisecond)
+	_, ok := rl.Acquire(context.Background(), "k", 0, 1, 60*time.Millisecond)
 	elapsed := time.Since(start)
 
 	if ok {
@@ -72,12 +73,12 @@ func TestAcquireTimesOutWhenNoSlotFrees(t *testing.T) {
 // with no queueTimeoutMs configured is refused at once, exactly as before.
 func TestAcquireZeroTimeoutIsImmediate(t *testing.T) {
 	rl := NewRateLimiter(time.Minute)
-	if _, ok := rl.Acquire("k", 0, 1, 0); !ok {
+	if _, ok := rl.Acquire(context.Background(), "k", 0, 1, 0); !ok {
 		t.Fatal("first acquire should win the only slot")
 	}
 
 	start := time.Now()
-	if _, ok := rl.Acquire("k", 0, 1, 0); ok {
+	if _, ok := rl.Acquire(context.Background(), "k", 0, 1, 0); ok {
 		t.Error("second acquire should not have succeeded")
 	}
 	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
@@ -90,7 +91,7 @@ func TestAcquireZeroTimeoutIsImmediate(t *testing.T) {
 func TestAcquireUnlimitedSkipsQueue(t *testing.T) {
 	rl := NewRateLimiter(time.Minute)
 	for i := 0; i < 50; i++ {
-		if _, ok := rl.Acquire("k", 0, 0, 5*time.Second); !ok {
+		if _, ok := rl.Acquire(context.Background(), "k", 0, 0, 5*time.Second); !ok {
 			t.Fatalf("acquire %d failed despite no concurrency cap", i)
 		}
 	}
@@ -338,6 +339,46 @@ func TestLimitsForDefaultQueueTimeout(t *testing.T) {
 	if uncapped.QueueTimeout != 0 {
 		t.Errorf("uncapped QueueTimeout = %v, want 0", uncapped.QueueTimeout)
 	}
+
+	// A key that sets its OWN queue timeout of zero-like absence but has a
+	// per-key concurrency cap keeps the documented default.
+	explicit := limitsFor(&models.APIKey{RateLimitConcurrency: new(2), QueueTimeoutMs: new(250)}, nil)
+	if explicit.QueueTimeout != 250*time.Millisecond {
+		t.Errorf("explicit QueueTimeout = %v, want 250ms", explicit.QueueTimeout)
+	}
+}
+
+// TestGlobalConcurrencyDefaultDoesNotQueue is the regression for the reviewer's
+// blocking issue #1: a concurrency cap that arrives ONLY from the operator's
+// global fallback must not silently acquire the 60s queue default. On the
+// release before this change such a key was refused immediately; giving it a
+// minute-long wait is a behaviour change the dashboard cannot show (the key
+// reads "unset").
+func TestGlobalConcurrencyDefaultDoesNotQueue(t *testing.T) {
+	globalOnly := func() Limits { return Limits{Concurrency: 4} }
+
+	// Key with nothing of its own: concurrency is global, so no queue.
+	l := limitsFor(&models.APIKey{ID: "k"}, globalOnly)
+	if l.Concurrency != 4 {
+		t.Fatalf("Concurrency = %d, want 4 from the global fallback", l.Concurrency)
+	}
+	if l.QueueTimeout != 0 {
+		t.Errorf("QueueTimeout = %v for a global-only concurrency cap, want 0 (immediate refusal)", l.QueueTimeout)
+	}
+
+	// The same key, but with its own queue timeout: the operator opted in, so it
+	// applies even though the cap is global.
+	optedIn := limitsFor(&models.APIKey{ID: "k", QueueTimeoutMs: new(500)}, globalOnly)
+	if optedIn.QueueTimeout != 500*time.Millisecond {
+		t.Errorf("opt-in QueueTimeout = %v, want 500ms", optedIn.QueueTimeout)
+	}
+
+	// The same key, but with its own concurrency cap: the documented default
+	// applies even without a global fallback.
+	perKey := limitsFor(&models.APIKey{ID: "k", RateLimitConcurrency: new(4)}, nil)
+	if perKey.QueueTimeout != DefaultQueueTimeout {
+		t.Errorf("per-key QueueTimeout = %v, want %v", perKey.QueueTimeout, DefaultQueueTimeout)
+	}
 }
 
 // TestRateLimitScopeLabelsTruthfully guards the metric label: a refusal must
@@ -383,7 +424,7 @@ func TestCheckReturnsRefusedScope(t *testing.T) {
 	}
 
 	// Concurrency when explicitly asked for (the helper still supports it).
-	if _, ok := rl.Acquire("c2", 0, 1, 0); !ok {
+	if _, ok := rl.Acquire(context.Background(), "c2", 0, 1, 0); !ok {
 		t.Fatal("acquire should win the only slot")
 	}
 	allowed, _, scope = rl.Check("c2", 0, 0, 1, 0)
@@ -418,7 +459,7 @@ func TestAcquireNeverExceedsCapUnderLoad(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, ok := rl.Acquire("stress", 0, cap, deadline)
+			_, ok := rl.Acquire(context.Background(), "stress", 0, cap, deadline)
 			if !ok {
 				t.Error("acquire timed out under load despite a generous deadline")
 				return

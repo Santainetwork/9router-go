@@ -37,6 +37,11 @@ type RateLimiter struct {
 	window       time.Duration
 	// maxKeys bounds every per-key map. Eviction prunes them together.
 	maxKeys int
+	// maxQueueDepth bounds how many requests may park on ONE key. Past it a
+	// request is refused rather than queued, so a flood against a saturated
+	// key costs a 429, not one goroutine per caller. It is a field, not a
+	// constant, so a test can shrink it.
+	maxQueueDepth int
 }
 
 // waitQueue is the FIFO of parked requests for one key.
@@ -75,13 +80,14 @@ func NewRateLimiter(window time.Duration) *RateLimiter {
 		window = time.Minute
 	}
 	return &RateLimiter{
-		windows:      make(map[string]*slidingWindow),
-		tokens:       make(map[string]*tokenBucket),
-		active:       make(map[string]*int32),
-		queues:       make(map[string]*waitQueue),
-		windowTimers: make(map[string]*time.Timer),
-		window:       window,
-		maxKeys:      10000,
+		windows:       make(map[string]*slidingWindow),
+		tokens:        make(map[string]*tokenBucket),
+		active:        make(map[string]*int32),
+		queues:        make(map[string]*waitQueue),
+		windowTimers:  make(map[string]*time.Timer),
+		window:        window,
+		maxKeys:       10000,
+		maxQueueDepth: DefaultMaxQueueDepth,
 	}
 }
 
@@ -155,11 +161,17 @@ func (rl *RateLimiter) ReleaseConcurrency(keyID string) {
 // admit it. A zero timeout preserves the pre-queue behaviour (try once, refuse),
 // so a key that never configured queueTimeoutMs is unchanged.
 //
+// ctx is honoured: a caller that hangs up (or a server shutdown) leaves the
+// queue without being granted a slot. Without that, a cancelled client would
+// still be parked, then dispatched upstream on the next free slot — an upstream
+// call billed to nobody, and a concurrency slot released for a result no one
+// will read.
+//
 // TPM is not queueable: unlike an RPM window, a token bucket refills
 // continuously, so a waiter could be granted and immediately re-refuse forever.
 // Callers size TPM against the body before calling here; a TPM refusal is a 429
 // from Check, not a wait.
-func (rl *RateLimiter) Acquire(keyID string, rpm, concurrency int, timeout time.Duration) (waited time.Duration, ok bool) {
+func (rl *RateLimiter) Acquire(ctx context.Context, keyID string, rpm, concurrency int, timeout time.Duration) (waited time.Duration, ok bool) {
 	start := time.Now()
 
 	// Fast path: admit without queueing if both axes have room.
@@ -170,6 +182,15 @@ func (rl *RateLimiter) Acquire(keyID string, rpm, concurrency int, timeout time.
 		return 0, false
 	}
 
+	// A caller that is already gone must not be parked at all.
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return 0, false
+		default:
+		}
+	}
+
 	w := &waiter{grant: make(chan struct{}, 1), rpm: rpm, concurrency: concurrency}
 	deadline := start.Add(timeout)
 
@@ -177,22 +198,39 @@ func (rl *RateLimiter) Acquire(keyID string, rpm, concurrency int, timeout time.
 	// failure and the enqueue cannot be lost: either the pump sees us at the
 	// head and grants immediately, or it grants on the next free.
 	rl.mu.Lock()
-	rl.queueForLocked(keyID).waiters = append(rl.queueForLocked(keyID).waiters, w)
+	// Depth cap: past it, refuse rather than park another live goroutine. This
+	// is the pre-queue behaviour on a key with no queue budget, and it keeps a
+	// rate-limit rejection from turning into unbounded memory growth under a
+	// flood.
+	if q := rl.queueForLocked(keyID); len(q.waiters) >= rl.maxQueueDepth {
+		rl.mu.Unlock()
+		return time.Since(start), false
+	} else {
+		q.waiters = append(q.waiters, w)
+	}
 	rl.pumpLocked(keyID)
 	rl.mu.Unlock()
 
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 
+	// ctxDone is nil when there is no caller context, which disables the case
+	// in the select below rather than firing on a nil channel.
+	var ctxDone <-chan struct{}
+	if ctx != nil {
+		ctxDone = ctx.Done()
+	}
+
 	select {
 	case <-w.grant:
 		return time.Since(start), true
 	case <-timer.C:
+	case <-ctxDone:
 	}
 
-	// Timed out. Mark the waiter done and let the pump discard it. A grant may
-	// have raced in at the deadline; if it did, we are now holding a slot we
-	// will never use, so release it rather than leak it.
+	// Timed out or the caller went away. Mark the waiter done and let the pump
+	// discard it. A grant may have raced in at the deadline; if it did, we are
+	// now holding a slot we will never use, so release it rather than leak it.
 	rl.mu.Lock()
 	w.done = true
 	select {
@@ -274,8 +312,15 @@ func (rl *RateLimiter) windowHasRoomLocked(keyID string, rpm int, now time.Time)
 }
 
 // recordStampLocked appends a request stamp to the key's window.
+//
+// Eviction runs BEFORE the stamp and is told to spare keyID. The admitting key
+// is mid-flight: its window was just created by windowHasRoomLocked and is about
+// to receive the stamp this call appends. If the sweep reclaimed it — which it
+// could, since an RPM-limited key holds no concurrency slot and may have no
+// waiter — the stamp would land in a fresh window and the key would be admitted
+// past its own RPM limit at the maxKeys boundary.
 func (rl *RateLimiter) recordStampLocked(keyID string, now time.Time) {
-	rl.evictIfNeededLocked()
+	rl.evictIfNeededLocked(keyID)
 	window := rl.windowForLocked(keyID)
 	window.stamps = append(window.stamps, now)
 }
@@ -438,6 +483,30 @@ func (rl *RateLimiter) SettleTokenUsage(keyID string, tpm, reserved, actual int)
 	}
 }
 
+// RefundTPM gives back a token-bucket charge that was taken for a request the
+// queue then refused.
+//
+// This is NOT SettleTokenUsage: settle only corrects an under-estimate and
+// never refunds, precisely so a client cannot bank credit by over-stating a
+// prompt. Here the request was never dispatched, so the charge is not a spend at
+// all and the full amount comes back. The refund is capped at the bucket's own
+// limit so a refund can never create more headroom than the key was ever given.
+func (rl *RateLimiter) RefundTPM(keyID string, tpm, amount int) {
+	if tpm <= 0 || keyID == "" || amount <= 0 {
+		return
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	bucket, exists := rl.tokens[keyID]
+	if !exists {
+		return
+	}
+	bucket.tokens += float64(amount)
+	if bucket.tokens > float64(tpm) {
+		bucket.tokens = float64(tpm)
+	}
+}
+
 func (rl *RateLimiter) rpmRetryAfter(keyID string, now time.Time) int {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -519,12 +588,18 @@ func (rl *RateLimiter) tpmRetryAfter(keyID string, tpm int, tokens int) int {
 // cannot defeat the bound — the next call evicts it once it drains.
 //
 // Must be called with rl.mu held.
-func (rl *RateLimiter) evictIfNeededLocked() {
+func (rl *RateLimiter) evictIfNeededLocked(keep string) {
 	if len(rl.windows) < rl.maxKeys {
 		return
 	}
 	target := rl.maxKeys * 9 / 10
 	for k := range rl.windows {
+		// Never evict the key whose admit is in progress: its window is about
+		// to be stamped by the caller, and reclaiming it here would let the
+		// stamp land in a fresh window and over-admit.
+		if k == keep {
+			continue
+		}
 		if rl.keyBusy(k) {
 			continue
 		}
@@ -603,19 +678,29 @@ func RequireRateLimit(rl *RateLimiter, defaults Defaults, usage TokenUsageReader
 			// refills continuously, so a queued request could be admitted and
 			// immediately re-refused forever. It is checked before the queue so
 			// an oversized prompt is refused without waiting at all.
+			pendingTPM := 0
 			if limits.TPM > 0 {
-				promptTokens := promptTokensForRequest(r)
-				if allowed, retryAfter, scope := rl.checkTPMOnly(apiKey.ID, limits.TPM, promptTokens); !allowed {
+				pendingTPM = promptTokensForRequest(r)
+				if allowed, retryAfter, scope := rl.checkTPMOnly(apiKey.ID, limits.TPM, pendingTPM); !allowed {
 					rejectRateLimited(w, apiKey.ID, limits, retryAfter, scope)
 					return
 				}
-				r = r.WithContext(withReservedTokens(r.Context(), promptTokens))
 			}
 
 			// RPM + concurrency: admit now if there is room, otherwise wait in
-			// FIFO order up to the key's queue timeout.
-			waited, ok := rl.Acquire(apiKey.ID, limits.RPM, limits.Concurrency, limits.QueueTimeout)
+			// FIFO order up to the key's queue timeout. The caller's context is
+			// passed so a client that hangs up leaves the queue instead of being
+			// granted a slot and dispatched upstream for nobody.
+			waited, ok := rl.Acquire(r.Context(), apiKey.ID, limits.RPM, limits.Concurrency, limits.QueueTimeout)
 			if !ok {
+				// The TPM charge was taken before the queue. A request the queue
+				// refused never reaches the metering path, so the settle hook can
+				// never reconcile it: the charge has to be given back here, or a
+				// key under a flood spends its token budget on turns that were
+				// never served.
+				if pendingTPM > 0 {
+					rl.RefundTPM(apiKey.ID, limits.TPM, pendingTPM)
+				}
 				rejectRateLimited(w, apiKey.ID, limits, queueRetryAfter(limits), queueScope(limits))
 				return
 			}
@@ -624,6 +709,14 @@ func RequireRateLimit(rl *RateLimiter, defaults Defaults, usage TokenUsageReader
 			}
 			if limits.Concurrency > 0 {
 				defer rl.ReleaseConcurrency(apiKey.ID)
+			}
+
+			// A TPM charge is an estimate; the meter reconciles it once the real
+			// usage is known. The reservation travels on the context so the settle
+			// hook is only installed for requests that were actually charged, and
+			// only now that the request is admitted.
+			if limits.TPM > 0 {
+				r = r.WithContext(withReservedTokens(r.Context(), pendingTPM))
 			}
 
 			next.ServeHTTP(w, r)
@@ -801,22 +894,48 @@ func limitsFor(apiKey *models.APIKey, d Defaults) Limits {
 	if v := derefInt(apiKey.TokenQuota); v > 0 {
 		out.TokenQuota = v
 	}
-	// The queue timeout only matters when a concurrency cap exists; a key with
-	// no cap never queues, so its timeout is left untouched.
-	if out.Concurrency > 0 {
+
+	// Queue timeout. The default only applies when the CONCURRENCY cap is the
+	// key's own column. A concurrency cap that arrived from the operator's
+	// global fallback must not silently acquire a 60s queue: on the release
+	// before this change such a key was refused immediately, and turning that
+	// into a minute-long wait is a behaviour change the dashboard cannot show
+	// (the key reads "unset").
+	//
+	// So the ordering is deliberate: peek at the key's own columns first.
+	keyConc := derefInt(apiKey.RateLimitConcurrency)
+	keyQueue := derefInt(apiKey.QueueTimeoutMs)
+	switch {
+	case keyQueue > 0:
+		// The operator set a queue timeout on the key: honour it, and it
+		// applies whether the concurrency cap is per-key or global.
+		out.QueueTimeout = time.Duration(keyQueue) * time.Millisecond
+	case keyConc > 0:
+		// The key set its own concurrency cap but no timeout: the documented
+		// default applies.
 		out.QueueTimeout = DefaultQueueTimeout
-	}
-	if v := derefInt(apiKey.QueueTimeoutMs); v > 0 {
-		out.QueueTimeout = time.Duration(v) * time.Millisecond
+	case out.Concurrency > 0:
+		// Concurrency came only from the global fallback: no queueing. This is
+		// the pre-change behaviour for such a key, and it is the one reading
+		// that keeps a global default from changing an existing install.
+		out.QueueTimeout = 0
 	}
 	return out
 }
 
+// DefaultMaxQueueDepth is how many requests may wait on one key. It bounds the
+// memory a saturated key can hold: each parked request is a live goroutine with
+// its parsed body, so an unbounded queue turns a rate-limit rejection into
+// unbounded growth. Chosen well above any real concurrency ceiling so it never
+// refuses a legitimate burst, but low enough to cap a flood.
+const DefaultMaxQueueDepth = 1024
+
 // DefaultQueueTimeout is how long a request waits for a free concurrency slot
-// when the key does not set its own queueTimeoutMs. It matches the upstream
-// reference's own 60s fallback, so a key that only sets a concurrency cap
-// behaves the same on both gateways rather than being refused on the first
-// collision here.
+// when the key sets its own concurrency cap but no queueTimeoutMs. It matches
+// the upstream reference's own 60s fallback, so a key that only sets a
+// concurrency cap behaves the same on both gateways rather than being refused
+// on the first collision here. It is NOT applied when the concurrency cap came
+// from the operator's global fallback: see limitsFor.
 const DefaultQueueTimeout = 60 * time.Second
 
 func derefInt(v *int) int {

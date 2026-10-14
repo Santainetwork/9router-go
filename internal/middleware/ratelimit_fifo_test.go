@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -15,7 +16,7 @@ func TestQueueIsFIFO(t *testing.T) {
 	const key = "fifo"
 
 	// Hold the only concurrency slot.
-	if _, ok := rl.Acquire(key, 0, 1, 0); !ok {
+	if _, ok := rl.Acquire(context.Background(), key, 0, 1, 0); !ok {
 		t.Fatal("failed to take the only slot")
 	}
 
@@ -33,7 +34,7 @@ func TestQueueIsFIFO(t *testing.T) {
 			// A short, ordered stagger guarantees enqueue order is the
 			// goroutine order; the queue must preserve it.
 			time.Sleep(time.Duration(idx) * 5 * time.Millisecond)
-			if _, ok := rl.Acquire(key, 0, 1, 3*time.Second); !ok {
+			if _, ok := rl.Acquire(context.Background(), key, 0, 1, 3*time.Second); !ok {
 				t.Errorf("waiter %d timed out", idx)
 				return
 			}
@@ -69,14 +70,14 @@ func TestQueueWaitsForRPMWindow(t *testing.T) {
 	const key = "rpm-queue"
 
 	// Fill the window: 1 request per 120ms.
-	if _, ok := rl.Acquire(key, 1, 0, 0); !ok {
+	if _, ok := rl.Acquire(context.Background(), key, 1, 0, 0); !ok {
 		t.Fatal("first request refused")
 	}
 
 	// The second cannot be admitted now (window full) but must be granted when
 	// the window rolls, well inside a generous timeout.
 	start := time.Now()
-	waited, ok := rl.Acquire(key, 1, 0, 2*time.Second)
+	waited, ok := rl.Acquire(context.Background(), key, 1, 0, 2*time.Second)
 	if !ok {
 		t.Fatal("second request timed out waiting for the RPM window")
 	}
@@ -94,12 +95,12 @@ func TestQueueRPMTimeoutRefuses(t *testing.T) {
 	rl := NewRateLimiter(time.Minute) // 60s window: will not roll during the test
 	const key = "rpm-timeout"
 
-	if _, ok := rl.Acquire(key, 1, 0, 0); !ok {
+	if _, ok := rl.Acquire(context.Background(), key, 1, 0, 0); !ok {
 		t.Fatal("first request refused")
 	}
 
 	start := time.Now()
-	_, ok := rl.Acquire(key, 1, 0, 40*time.Millisecond)
+	_, ok := rl.Acquire(context.Background(), key, 1, 0, 40*time.Millisecond)
 	if ok {
 		t.Fatal("second request admitted despite a full 60s window")
 	}
@@ -117,13 +118,13 @@ func TestQueueAdmitIsAtomicOnBothAxes(t *testing.T) {
 	const key = "atomic"
 
 	// RPM room for 5 requests, concurrency cap of 1.
-	if _, ok := rl.Acquire(key, 5, 1, 0); !ok {
+	if _, ok := rl.Acquire(context.Background(), key, 5, 1, 0); !ok {
 		t.Fatal("first request refused")
 	}
 
 	// Ten more requests, all refused on concurrency (slot held, zero timeout).
 	for i := 0; i < 10; i++ {
-		if _, ok := rl.Acquire(key, 5, 1, 0); ok {
+		if _, ok := rl.Acquire(context.Background(), key, 5, 1, 0); ok {
 			t.Fatal("request admitted despite the slot being held")
 		}
 	}
@@ -148,10 +149,10 @@ func TestQueueSoakNoQueueLeak(t *testing.T) {
 		key := keyName(i)
 		// Take the slot, queue a second request with a hair of patience, then
 		// let both finish.
-		if _, ok := rl.Acquire(key, 0, 1, 0); !ok {
+		if _, ok := rl.Acquire(context.Background(), key, 0, 1, 0); !ok {
 			t.Fatalf("iteration %d: slot not taken", i)
 		}
-		rl.Acquire(key, 0, 1, time.Millisecond) // parks then times out
+		rl.Acquire(context.Background(), key, 0, 1, time.Millisecond) // parks then times out
 		rl.ReleaseConcurrency(key)
 	}
 

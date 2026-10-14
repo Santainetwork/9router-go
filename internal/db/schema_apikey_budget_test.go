@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -126,5 +127,43 @@ func TestSchemaDatabaseFileIsNotLeftBehind(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("expected the database file to exist at %s: %v", path, err)
+	}
+}
+
+// TestUsageHistoryApiKeyIndexExists proves the index the token-quota sum needs
+// is created with the core schema. Without it GetApiKeyTokenUsage scans the
+// whole (unpruned) ledger on every request for a quota-bearing key.
+func TestUsageHistoryApiKeyIndexExists(t *testing.T) {
+	r := openEphemeralSchemaDB(t)
+
+	var count int
+	if err := r.db.QueryRow(
+		`SELECT COUNT(1) FROM sqlite_master WHERE type = 'index' AND name = 'idx_uh_apikey'`,
+	).Scan(&count); err != nil {
+		t.Fatalf("query index: %v", err)
+	}
+	if count != 1 {
+		t.Fatal("idx_uh_apikey is missing; the quota sum would full-scan usageHistory")
+	}
+
+	// And the planner must actually use it for the quota query.
+	rows, err := r.db.Query(`EXPLAIN QUERY PLAN
+		SELECT COALESCE(SUM(COALESCE(promptTokens,0) + COALESCE(completionTokens,0)), 0)
+		  FROM usageHistory WHERE apiKey = ? OR apiKey = ?`, "k", "k")
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	defer rows.Close()
+	var plan string
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatalf("scan plan: %v", err)
+		}
+		plan += detail + "\n"
+	}
+	if !strings.Contains(plan, "idx_uh_apikey") {
+		t.Errorf("query plan does not use idx_uh_apikey:\n%s", plan)
 	}
 }

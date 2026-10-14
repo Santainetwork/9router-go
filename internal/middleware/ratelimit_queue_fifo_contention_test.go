@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -21,7 +22,7 @@ func TestQueueFIFOUnderContention(t *testing.T) {
 	)
 	for round := 0; round < 30; round++ {
 		rl := NewRateLimiter(time.Minute)
-		if _, ok := rl.Acquire(key, 0, 1, 0); !ok {
+		if _, ok := rl.Acquire(context.Background(), key, 0, 1, 0); !ok {
 			t.Fatal("failed to take the only slot")
 		}
 
@@ -35,7 +36,7 @@ func TestQueueFIFOUnderContention(t *testing.T) {
 			wg.Add(1)
 			go func(id int) {
 				defer wg.Done()
-				if _, ok := rl.Acquire(key, 0, 1, 5*time.Second); !ok {
+				if _, ok := rl.Acquire(context.Background(), key, 0, 1, 5*time.Second); !ok {
 					t.Errorf("round %d: waiter %d timed out", round, id)
 					return
 				}
@@ -96,7 +97,7 @@ func TestQueueMixedAxisAdmitsCorrectly(t *testing.T) {
 	const key = "mixed"
 
 	// Take the one RPM stamp and the one concurrency slot.
-	if _, ok := rl.Acquire(key, 1, 1, 0); !ok {
+	if _, ok := rl.Acquire(context.Background(), key, 1, 1, 0); !ok {
 		t.Fatal("first request refused")
 	}
 
@@ -105,7 +106,7 @@ func TestQueueMixedAxisAdmitsCorrectly(t *testing.T) {
 	// still full, so it must wait for the window, then succeed.
 	done := make(chan bool, 1)
 	go func() {
-		_, ok := rl.Acquire(key, 1, 1, 2*time.Second)
+		_, ok := rl.Acquire(context.Background(), key, 1, 1, 2*time.Second)
 		done <- ok
 	}()
 
@@ -138,7 +139,7 @@ func TestQueueDrainsWithMultipleSlots(t *testing.T) {
 
 	// Fill all slots.
 	for i := 0; i < slots; i++ {
-		if _, ok := rl.Acquire(key, 0, slots, 0); !ok {
+		if _, ok := rl.Acquire(context.Background(), key, 0, slots, 0); !ok {
 			t.Fatalf("slot %d not taken", i)
 		}
 	}
@@ -149,7 +150,7 @@ func TestQueueDrainsWithMultipleSlots(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			if _, ok := rl.Acquire(key, 0, slots, 5*time.Second); ok {
+			if _, ok := rl.Acquire(context.Background(), key, 0, slots, 5*time.Second); ok {
 				admitted[idx] = true
 				time.Sleep(5 * time.Millisecond)
 				rl.ReleaseConcurrency(key)
@@ -177,10 +178,10 @@ func TestQueueWindowTimersAreCleanedUp(t *testing.T) {
 	const key = "timers"
 
 	// Fill the window and queue a waiter that will be admitted on rollover.
-	if _, ok := rl.Acquire(key, 1, 0, 0); !ok {
+	if _, ok := rl.Acquire(context.Background(), key, 1, 0, 0); !ok {
 		t.Fatal("first request refused")
 	}
-	if p, ok := rl.Acquire(key, 1, 0, time.Second); !ok {
+	if p, ok := rl.Acquire(context.Background(), key, 1, 0, time.Second); !ok {
 		t.Fatalf("queued request refused (p=%v)", p)
 	}
 
@@ -208,7 +209,7 @@ func TestEvictionNeverStrandsParkedWaiter(t *testing.T) {
 	// Queue a waiter on a key that occupies NO concurrency slot: RPM-only, with
 	// the window full. This is the case keyBusy does NOT cover.
 	const parked = "parked"
-	if _, ok := rl.Acquire(parked, 1, 0, 0); !ok { // fills the 1-request window
+	if _, ok := rl.Acquire(context.Background(), parked, 1, 0, 0); !ok { // fills the 1-request window
 		t.Fatal("seed request refused")
 	}
 	done := make(chan bool, 1)
@@ -217,7 +218,7 @@ func TestEvictionNeverStrandsParkedWaiter(t *testing.T) {
 		// entry would show up as this waiter being stranded (it would still
 		// resolve at its own timeout, but the queue map check below is what
 		// proves it was not evicted).
-		_, ok := rl.Acquire(parked, 1, 0, 700*time.Millisecond)
+		_, ok := rl.Acquire(context.Background(), parked, 1, 0, 700*time.Millisecond)
 		done <- ok
 	}()
 	// Let the waiter park.

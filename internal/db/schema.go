@@ -149,6 +149,14 @@ func coreSchema() []tableDef {
 				"CREATE INDEX IF NOT EXISTS idx_uh_conn ON usageHistory(connectionId)",
 				"CREATE INDEX IF NOT EXISTS idx_uh_ts_prov ON usageHistory(timestamp DESC, provider)",
 				"CREATE INDEX IF NOT EXISTS idx_uh_ts_model ON usageHistory(timestamp DESC, model)",
+				// The per-key lifetime token quota sums prompt+completion tokens
+				// WHERE apiKey = ? on every request for a quota-bearing key, and
+				// this ledger is never pruned (see usage_retention.go: it is the
+				// billing record). Without this index that sum is a full scan —
+				// measured at ~150 ms on a 200k-row ledger versus sub-millisecond
+				// with it. EnsureCoreSchema re-runs this list on every boot, so
+				// existing installs pick the index up on the next start.
+				"CREATE INDEX IF NOT EXISTS idx_uh_apikey ON usageHistory(apiKey)",
 			},
 		},
 		{

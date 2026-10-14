@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -31,8 +32,8 @@ func TestEvictionPrunesEveryMap(t *testing.T) {
 		// queue map so eviction has something to prune, without the 1ms wait per
 		// key across all 12000.
 		if i < 200 {
-			if _, ok := rl.Acquire(key, 1, 1, 0); ok {
-				rl.Acquire(key, 1, 1, time.Millisecond)
+			if _, ok := rl.Acquire(context.Background(), key, 1, 1, 0); ok {
+				rl.Acquire(context.Background(), key, 1, 1, time.Millisecond)
 				rl.ReleaseConcurrency(key)
 			}
 		}
@@ -60,7 +61,7 @@ func TestEvictionNeverDropsBusyKey(t *testing.T) {
 
 	// Hold a slot on a specific key that we will then try to evict.
 	const busyKey = "busy-key"
-	if _, ok := rl.Acquire(busyKey, 0, 1, 0); !ok {
+	if _, ok := rl.Acquire(context.Background(), busyKey, 0, 1, 0); !ok {
 		t.Fatal("busy key failed to acquire its slot")
 	}
 
@@ -94,13 +95,13 @@ func TestQueuesAreIsolatedBetweenKeys(t *testing.T) {
 	rl := NewRateLimiter(time.Minute)
 
 	// Saturate key A.
-	if _, ok := rl.Acquire("A", 0, 1, 0); !ok {
+	if _, ok := rl.Acquire(context.Background(), "A", 0, 1, 0); !ok {
 		t.Fatal("A failed to acquire")
 	}
 
 	// Key B, with the same cap, must acquire immediately.
 	start := time.Now()
-	_, ok := rl.Acquire("B", 0, 1, 0)
+	_, ok := rl.Acquire(context.Background(), "B", 0, 1, 0)
 	if !ok {
 		t.Fatal("B was blocked by A's saturation — queues are not isolated")
 	}
