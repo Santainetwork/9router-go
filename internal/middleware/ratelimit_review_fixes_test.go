@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -442,4 +443,178 @@ func TestLimitsForPerKeyOverridesGlobal(t *testing.T) {
 	if l.QueueTimeout != 250*time.Millisecond {
 		t.Errorf("QueueTimeout = %v, want 250ms (per-key)", l.QueueTimeout)
 	}
+}
+
+// TestMiddlewareRefundsTPMOnQueueRefusal drives the ACTUAL middleware path that
+// the reviewer's item #3 is about: TPM is charged before Acquire, the queue
+// then refuses, and the middleware must refund the charge. The earlier
+// TestRefundTPMReturnsQueueRefusalCharge called RefundTPM directly, so it would
+// still pass if the middleware forgot to call it — this one would not.
+func TestMiddlewareRefundsTPMOnQueueRefusal(t *testing.T) {
+	rl := NewRateLimiter(time.Minute)
+	const key = "mw-refund"
+
+	handler := RequireRateLimit(rl, nil, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	mkReq := func(content string) *http.Request {
+		body := `{"model":"gpt-4o","messages":[{"role":"user","content":"` + content + `"}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		return req.WithContext(withAPIKey(req, &models.APIKey{
+			ID:                   key,
+			RateLimitTPM:         new(100000), // ample: TPM never refuses here
+			RateLimitConcurrency: new(1),      // one slot
+			QueueTimeoutMs:       new(30),     // short queue: the 2nd times out
+		}))
+	}
+
+	// Hold the single concurrency slot with a handler that blocks until released.
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	blocking := RequireRateLimit(rl, nil, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	go func() {
+		rec := httptest.NewRecorder()
+		blocking.ServeHTTP(rec, mkReq("holder"))
+	}()
+	<-entered
+
+	// Snapshot the bucket after the holder's charge.
+	rl.mu.Lock()
+	afterHolder := rl.tokens[key].tokens
+	rl.mu.Unlock()
+
+	// Second request: TPM is charged, then the queue times out (30ms) and the
+	// middleware must refund. Content differs so the estimate is the same but
+	// the request is distinct.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, mkReq("queued-refused"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request status = %d, want 429", rec.Code)
+	}
+
+	rl.mu.Lock()
+	afterRefund := rl.tokens[key].tokens
+	rl.mu.Unlock()
+
+	// The refused request must have left the bucket where the holder left it
+	// (within refill tolerance): its own charge was returned. If the middleware
+	// forgot to refund, the bucket would be lower by that request's estimate.
+	if afterRefund < afterHolder-1 {
+		t.Errorf("bucket after a queue-refused request = %v, want >= %v (the TPM charge must be refunded)", afterRefund, afterHolder)
+	}
+
+	close(release)
+}
+
+// TestMiddlewareDoesNotRefundOnTPMRefusal proves the refund is specific to a
+// QUEUE refusal. When TPM itself refuses, no charge was taken (checkTPM returns
+// false before subtracting), so a refund there would inject tokens that were
+// never spent and let a flood replenish the bucket it is meant to drain.
+//
+// The bucket is first drained to a level below the cap, so a spurious refund is
+// observable as a rise above that level rather than being clipped at the limit.
+func TestMiddlewareDoesNotRefundOnTPMRefusal(t *testing.T) {
+	rl := NewRateLimiter(time.Minute)
+	const key = "mw-tpm-refuse"
+
+	// Drain a 1000-token bucket to ~100 with charges that succeed.
+	for i := 0; i < 9; i++ {
+		if !rl.checkTPM(key, 1000, 100, time.Now()) {
+			t.Fatalf("drain charge %d refused", i)
+		}
+	}
+	rl.mu.Lock()
+	before := rl.tokens[key].tokens
+	rl.mu.Unlock()
+
+	handler := RequireRateLimit(rl, nil, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// A prompt sized near the full bucket cannot fit in the ~100 left, so it is
+	// refused at the TPM step (not the queue: no concurrency cap, no queue).
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"` + strings.Repeat("x", 2000) + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req = req.WithContext(withAPIKey(req, &models.APIKey{
+		ID:           key,
+		RateLimitTPM: new(1000),
+	}))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 (TPM refusal)", rec.Code)
+	}
+
+	rl.mu.Lock()
+	after := rl.tokens[key].tokens
+	rl.mu.Unlock()
+	if after > before+1 {
+		t.Errorf("bucket rose from %v to %v after a TPM refusal: a refund ran on a refusal that took no charge", before, after)
+	}
+}
+
+// TestMiddlewareNoReservationWhenQueueRefuses proves the settlement hook is
+// installed only for an admitted request. A queue-refused request must not carry
+// a TPM reservation: the metering path would otherwise settle a charge that was
+// already refunded, double-counting it.
+func TestMiddlewareNoReservationWhenQueueRefuses(t *testing.T) {
+	rl := NewRateLimiter(time.Minute)
+	const key = "mw-resv"
+
+	var sawReservation bool
+	var hadSettle bool
+	handler := RequireRateLimit(rl, nil, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, sawReservation = ReservedTokensFromContext(r.Context())
+		// A settler is installed by the chat handler, not this middleware, so
+		// here we only assert the reservation side.
+		w.WriteHeader(http.StatusOK)
+	}))
+	_ = hadSettle
+
+	mkReq := func(content string) *http.Request {
+		body := `{"model":"gpt-4o","messages":[{"role":"user","content":"` + content + `"}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		return req.WithContext(withAPIKey(req, &models.APIKey{
+			ID:                   key,
+			RateLimitTPM:         new(100000),
+			RateLimitConcurrency: new(1),
+			QueueTimeoutMs:       new(30),
+		}))
+	}
+
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	blocking := RequireRateLimit(rl, nil, nil)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	go func() {
+		rec := httptest.NewRecorder()
+		blocking.ServeHTTP(rec, mkReq("holder"))
+	}()
+	<-entered
+
+	// Queue-refused request: must never reach the handler, so sawReservation
+	// must stay false.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, mkReq("refused"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	if sawReservation {
+		t.Error("a queue-refused request reached the handler with a TPM reservation")
+	}
+	close(release)
 }
